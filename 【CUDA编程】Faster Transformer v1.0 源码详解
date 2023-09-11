@@ -1,0 +1,87 @@
+【CUDA编程】Faster Transformer v1.0 源码详解
+
+https://zhuanlan.zhihu.com/p/647012855
+
+写在前面：本文将对 Nvidia BERT 推理解决方案 Faster Transformer 源码进行深度剖析，
+详细分析作者的优化意图，并对源码中的加速技巧进行介绍，希望对读者有所帮助。
+本文源码解读的内容仅限 Faster Transformer v1.0 版本，更高版本的源码将在后续文章中继续解读。
+
+1 Faster Transformer
+Transformer 模型最早在 2017 年由谷歌在论文中提出，抛弃了以往深度学习任务里面使用到的 CNN 和 RNN，取而代之的是一种 self-Attention 的结构，
+将 Attention 思想发挥到了极致，一定程度上解决了 RNN 的长序列信息丢失问题，基本取代了 RNN 的地位。
+
+Transformer 一经面世便在 NLP 领域脱颖而出，近两年一些文章开创性地将 Transformer 模型跨领域地引用到了 CV 任务中，并取得了不错地成果。
+这也被许多学者认为是开创了 CV 领域的新时代，甚至可能完全取代传统的卷积操作。
+
+虽然 Transformer在多种场景下都有优秀的表现，但是在推理部署阶段，其计算性能却受到了巨大的挑战：
+以 BERT 为原型的多层 Transformer 模型，其性能常常难以满足在线业务对于低延迟和高吞吐的要求。
+
+以 BERT-BASE 为例，超过 90% 的计算时间消耗在 12 层 Transformer 的前向计算上。
+因此，一个高效的 Transformer 前向计算方案，既可以为在线业务带来降本增效的作用，
+也有利于以 Transformer 结构为核心的各类网络在更多实际工业场景中落地。
+
+基于上述背景，NVIDIA GPU 计算专家团队针对 Transformer 推理提出了的性能优化方案：Faster Transformer。
+Faster Transformer 是一个 BERT Transformer 单层前向计算的高效实现，其代码简洁明了，后续可以通过简单修改支持多种 Transformer 结构。
+目前优化集中在编码器（encoder）的前向计算。底层由 CUDA 和 cuBLAS 实现，支持 FP16 和 FP32 两种计算模式，
+其中 FP16 可以充分利用 Volta 和 Turing 架构 GPU 上的 Tensor Core 计算单元。
+
+2 优化原理
+在深入了解 Faster Transformer 的优化原理之前，我们先来了解一下主流深度学习框架 Tensorflow 中 Transformer 的实现情况，
+仅仅以一个基本的激活函数 gelu 为例，这个函数在框架中是通过 8 个类似 Pow、Add、和 Tanh 等基本 OP 来实现的。
+
+也就是说每进行一次 gelu 运算要调用 8 次基本 OP，同时底层也对应 8 次 GPU kernel 的调用，每一次调用也意味着一次显存读写，
+先不说 kernel 计算耗时，光是显存读写就已经是大量的开销。如何降低这部分开销？
+最直观的方法就是减少调用，让数据一直留在显存甚至寄存器里被访问，即 OP 融合，一次调用就实现整个计算逻辑。
+出于性能最大化的考虑，在 Faster Transformer 内部，Nividia 将除矩阵乘法以外的所有 kernel 都进行了尽可能的融合，单层 Tra
+former 的计算流程如下图所示:
+001.png
+如图所示，基于 OP 融合的思想，Faster Transformer 只用了 14 个 kernel 就完成了原来将近 60 个 kernel 的计算逻辑。
+这其中，8 个 kernel 是通过调用 cuBLAS 接口计算矩阵乘法（黄色框），其余 6 个是自定义 kernel（蓝色框）。
+接下来笔者将沿调用链逐步介绍每个 kernel 的优化逻辑。
+
+3 调用链
+Faster Transformer v1.0 版本源码地址如下，有兴趣的读者可以前往阅读。
+https://github.com/NVIDIA/FasterTransformer/tree/v1.0/fastertransformer
+
+通读源码后笔者对调用关系梳理如下。
+
+BertEncoderTransformer->forward()
+    ->OpenMultiHeadAttention->forward()
+        ->cublasGemmEx
+        ->cublasGemmEx
+        ->cublasGemmEx
+        ->multiHeadAttr_nofuse_kernelLauncher
+            ->add_QKV_bias  (kernel)
+            ->cublasGemmStridedBatchedEx
+            ->softmax_kernel    (kernel)
+            ->cublasGemmStridedBatchedEx
+            ->transpose (kernel)
+    ->cublasGemmEx
+    ->add_bias_input_layernorm_kernelLauncher   (kernel)
+    ->cublasGemmEx
+    ->add_bias_act_kernelLauncher   (kernel)
+    ->cublasGemmEx
+    ->add_bias_input_layernorm_kernelLauncher   (kernel)
+从调用链也可以看出，总共 14 个步骤，与示意图一一对应。
+核心逻辑都在两个类中实现：BertEncoderTransformer 和 OpenMultiHeadAttention。
+
+
+
+6 小结
+至此，Transformer encoder 前向计算的 14 个操作优化技巧已介绍完毕。总结如下：
+    针对半精度 fp16 的优化方面。
+    首先，在 kernel 的实现中，将输入的 half 指针转成 half2 类型，并使用了 half2 相关的数学函数。
+    这样不仅仅可以达到 2 倍于 half 的访存带宽和计算吞吐，还可以极大地减少指令的发射数量。
+    其次，在 softmax 以及 layerNormalization 的操作中，为防止求和溢出，将数据以 half2 的形式读入后，
+    会转成 float2 类型，来做求和计算，这里就非常细致了，尽可能地保障了较高精度，值得学习借鉴。
+
+    针对访存带宽方面，笔者以为除 fp16 以外其它数据类型也可以进一步优化，
+    比如可以自定义 pack 类型进行合并读写，尽量把带宽打满。
+
+    针对线程网络结构方面，源码中基本使用一个 block 处理一行数据的模式进行设计，
+    这里笔者私以为针对 seq_len 和 latent_dim 已知比较小的情况下（不超过1024），
+    完全可以一个线程束处理一行数据，束内同步的开销远小于块内同步。当然，这个要求确实有些苛刻了。
+
+    源码中提供了一个块内规约的代码，思路非常好，值得初学 cuda 的读者品读。
+
+发布于 2023-07-31 12:52・IP 属地上海

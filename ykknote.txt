@@ -1,0 +1,32 @@
+https://zhuanlan.zhihu.com/p/650462095
+【CUDA编程】Faster Transformer v2.0 源码详解
+
+https://zhuanlan.zhihu.com/p/647012855
+【CUDA编程】Faster Transformer v1.0 源码详解
+
+https://zhuanlan.zhihu.com/p/654368698
+【CUDA编程】Faster Transformer v2.1 源码详解
+
+https://zhuanlan.zhihu.com/p/655188392
+FasterTransformer v1.0源码解读(上)
+
+FasterTransformer 2.0优化——公开课听课笔记    ===无代码讲解，概括性强！
+https://blog.csdn.net/HUSTHY/article/details/105623889
+
+英伟达Fastertransformer源码解读  ===无代码讲解，概括性强！
+https://zhuanlan.zhihu.com/p/79528308
+
+FasterTransformer框架速览    ===无代码讲解，概括性强！
+https://www.6hu.cc/archives/153083.html
+https://juejin.cn/post/7219245946739179578
+
+
+使用 FasterTransformer 和 Triton 推理服务器加速大型 Transformer 模型的推理
+https://developer.nvidia.com/zh-cn/blog/accelerated-inference-for-large-transformer-models-using-nvidia-fastertransformer-and-nvidia-triton-inference-server/
+
+
+【BBuf 的 CUDA 笔记】六，总结 FasterTransformer Encoder(BERT) 的 cuda 相关优化技巧
+http://giantpandacv.com/project/OneFlow/%E3%80%90BBuf%E7%9A%84CUDA%E7%AC%94%E8%AE%B0%E3%80%91%E5%85%AD%EF%BC%8C%E6%80%BB%E7%BB%93%20FasterTransformer%20Encoder%28BERT%29%20%E7%9A%84cuda%E7%9B%B8%E5%85%B3%E4%BC%98%E5%8C%96%E6%8A%80%E5%B7%A7/
+
+https://www.birentech.com/Research_nstitute_details/4.html
+高性能Transformer推理分析

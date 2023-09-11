@@ -57,6 +57,10 @@ class OpenMultiHeadAttentionTraits<OperationType::HALF>
 
 /**
  * Multi-head attetion open sourced
+ * 4 OpenMultiHeadAttention
+OpenMultiHeadAttention 类中有两个重要的成员方法：构造函数、forward 方法。
+ 其中构造函数内主要进行一些参数初始化功能，设备内存的申请和初始化也在该函数内进行。
+ forward 方法内主要是多头注意力机制核心逻辑的具体实现。
  */
 template<OperationType OpType_>
 class OpenMultiHeadAttention: IMultiHeadAttention<OpType_>
@@ -145,7 +149,14 @@ class OpenMultiHeadAttention: IMultiHeadAttention<OpType_>
       throw error;
     }
   }
+/*
+ * 4.1 cublasGemmEx for Q、K、V
+forward 方法中首先就是对输入的 3 个 tensor 进行线性变换，其实就是对 3 个 tensor 分别进行 Dense 层变换，
+ 我们知道 Dense 是包含一个矩阵乘法和一个 add_bias 操作，
+ 这里只进行矩阵乘法，add_bias 操作放在后面的 kernel 进行。这里使用了 cuBLAS 接口计算矩阵乘法，具体代码如下：
 
+ 这里仅仅是矩阵乘法 API 的调用，按文档传参即可，这里不展开介绍，笔者计划另开一篇文章专门介绍这个 API 的调用方法。
+ * */
   void forward()
   {
 #ifndef NDEBUG

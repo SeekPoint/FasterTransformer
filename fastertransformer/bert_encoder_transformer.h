@@ -212,7 +212,20 @@ class BertEncoderTransformer:IEncoderTransformer<Traits_::OpType>
       cudaDeviceSynchronize();
       check_cuda_error(cudaGetLastError());
 #endif
+/*
+ 5 BertEncoderTransformer
+BertEncoderTransformer 类中有两个重要的成员方法：构造函数、forward 方法。
+ 其中构造函数内主要进行一些参数初始化功能，设备内存的申请和初始化也在该函数内进行。
+ forward 方法内主要是核心逻辑的实现。
 
+5.1 attention forward
+根据调用链可知，BertEncoderTransformer->forward() 中第一步就是 attention_->forward()，
+ 其中 attention_ 对象在构造函数中被定义，attention_->forward() 执行的就是第 4 节的内容。
+
+5.2 对 attention out 做线性变换
+根据流程图和调用链可知，这一步是对多头注意力的输出 tensor 做一层线性变换，右乘一个参数矩阵，
+ 其实就是一个不加激活函数的 Dense 层，分为矩阵乘法和 add bias 两个操作步骤，这里调用了 cuBLAS API 实现矩阵乘法。
+ * */
       DataType_ alpha = (DataType_)1.0f;
       DataType_ beta = (DataType_)0.0f;
       int m = batch_size_ * from_seq_len_;
@@ -238,7 +251,17 @@ class BertEncoderTransformer:IEncoderTransformer<Traits_::OpType>
       cudaDeviceSynchronize();
       check_cuda_error(cudaGetLastError());
 #endif
+/*
+5.4 FeedForward 结构
+根据 Transformer 模型结构，多头注意力之后为了增强表达能力，加了一个 FeedForward 层，该结构内部就是两个 Dense 层，
+ 第一层 Dense 中使用了激活函数，第二层没有激活函数。
+ 所以 FeedForward 层中包含了 5 个操作：矩阵乘法、add bias、activation、矩阵乘法、add bias。
 
+5.4.1 attention out * inter kernel
+FeedForward 层第一次线性变换会扩展 tensor 的最后一个维度的长度，源码中将 latent_dim（也就是 n）扩展为原来的 4 倍，
+ 所以这里的 inter kernel 的形状为 [latent_dim, 4 * latent_dim]，
+ 矩阵运算后的输出 tensor 形状为 [batch_size, seq_len, 4 * latent_dim]。
+ * */
       n *= 4;
       check_cuda_error(cublasGemmEx(param_.cublas_handle, 
         CUBLAS_OP_N, CUBLAS_OP_N,
@@ -257,7 +280,13 @@ class BertEncoderTransformer:IEncoderTransformer<Traits_::OpType>
       cudaDeviceSynchronize();
       check_cuda_error(cudaGetLastError());
 #endif
-
+/*
+5.4.3 inter out * out kernel
+FeedForward 层第二次线性变换将 tensor 的最后一个维度的长度转换为原始大小，
+ 源码中将 n 重新赋值为 latent_dim，
+ 所以这里的 out kernel 的形状为 [4 * latent_dim, latent_dim]，
+ 矩阵运算后的输出 tensor 形状为 [batch_size, seq_len, latent_dim]。
+ * */
       n = k;
       k *= 4;
       check_cuda_error(cublasGemmEx(param_.cublas_handle, 
