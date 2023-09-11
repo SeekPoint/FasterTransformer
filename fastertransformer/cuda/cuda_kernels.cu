@@ -273,6 +273,16 @@ void add_bias_input_layernorm_kernelLauncher(half* out, const half* input, const
   add_bias_input_layernorm<half><<<grid, block, 0, stream>>>(out, input, bias, gamma, beta, m, n);
 }
 
+/*4.10.1 broadcast_kernelLauncher
+beam search 的计算依据就是整个序列的条件概率，
+ 也就是说要把每个 step 的概率连乘起来，
+ 所以对于当前 step 来说各 beam 下每个 word 的概率首先应该乘以前面所有 step 组成序列的累计概率，
+ 由于我们这里的概率值在 update 函数中计算的是 log 值，所以把这里把连乘换成累加。
+
+cum_log_probs 的形状是 [batch_size, beam_width]，表示每个 beam 下的累计概率，
+ 这里给 log_probs 加上累计概率之后，
+ 就表示一个 batch 中第 batch_id 个样本第 beam_id 个 beam 的第 word_id 个 word 作为当前 step 下输出 token 的概率。
+ 核函数计算逻辑非常简单，可以直接看代码。*/
 void broadcast_kernelLauncher(float* log_probs, float* cum_log_probs, const int batch_size, const int beam_width, 
   const int vocab_size, cudaStream_t stream)
 {
@@ -284,6 +294,13 @@ void broadcast_kernelLauncher(float* log_probs, float* cum_log_probs, const int 
   broadcast_kernel<float><<<grid, block, 0, stream>>>(log_probs, cum_log_probs, batch_size, beam_width, vocab_size, N);
 }
 
+/*4.10.2 topK
+对于一个样本而言拿到 log_probs 后我们就得到了 beam_width 个分支下共 beam_width * vocab_size 条路径的概率，
+ 按照 beam search 的计算思想，
+ 我们需要找到这 beam_width * vocab_size 个路径中概率最大的 beam_width 个路径，
+ 这是一个求 topK 的问题。
+
+ 由于 vocab_size 数值比较大为了保障效率，源码通过两轮 topK 操作求出 topK。*/
 template <typename T>
 __global__
 void topK_kernel(const T* log_probs, int* ids, const int batch_size, const int N, const int K)
@@ -314,6 +331,18 @@ void topK_kernel(const T* log_probs, int* ids, const int batch_size, const int N
   }
 }
 
+/**
+ * @brief for each batch, get the final TopK values out from grid.x * K values
+ *
+ * @tparam T
+ * @param log_probs             [batch_size, beam_width, vocab_size]
+ * @param ids                   [batch_size, N]
+ * @param batch_size
+ * @param N                     gridDim.x(1st) * beam_width
+ * @param K                     beam_width
+ * @param id_offset             beam_width * vocab_size
+ * @return __global__
+ */
 template <typename T>
 __global__
 void topK_kernel_2nd(const T* log_probs, int* ids, const int batch_size, const int N, const int K, const int id_offset)
@@ -371,6 +400,27 @@ void topK_kernel_2nd(const T* log_probs, int* ids, const int batch_size, const i
   }
 }
 
+/*
+第一轮 topK 操作将 beam_width * vocab_size 个路径划分到每个 block 中计算，取 block_size 为 1024，
+对于一个样本来说，每个线程只处理一种可能路径，每个 block 内部求出一个 topK，所以最终计算完成后共有 grid_size_1st 个 topK。
+核函数中首先是一轮针对 batch_size 的循环，表示一个线程内部会处理多个样本，然后取出当前线程对应的路径的概率 val，
+然后开始求 topK。源码中求 topK 的思路非常之朴实无华，循环 K 次，每次块内规约取最大值，然后给当前最大值赋一个极小值防止干扰。
+取到最大值后，就把最大值所在的位置存入 ids 中，注意这里的位置包含 3 个信息：batch_id、beam_id、word_id，
+分别对应 log_probs 的三个维度，ids 的形状为 [batch_size, grid_size_1st, beam_width]。
+
+第二轮 topK 操作将 grid_size_1st * beam_width 个路径进一步缩小到 beam_width 个路径，
+本轮计算全部在一个 block 内完成，取 block_size 为 1024，对于一个样本来说，每个线程只处理一种可能路径。
+说实话这个核函数实现过程过于复杂，笔者看了几遍都不能完全理解，笔者的想法是完全可以复用第一轮 topK 的核函数进行计算，
+ 所以以下的解读仅代表笔者本人揣测，如有错误请读者评论或私信指出。
+
+核函数内部定义了一个共享内存数组 ids_before_sort 用来临时存储 topK 的位置，至于数组大小为什么是 16，
+ 笔者猜可能是目前 beam_width 最大支持取 16，但是笔者没有在任何官方声明里面看到这个信息。
+ 然后是针对 batch_size 的循环，表示一个线程内部会处理多个样本，然后取出当前线程对应的路径的概率 val 和 word 的位置 id。
+ 再来一轮循环，每次块内规约取最大值，然后给最大值赋一个极小值，把最大值的位置信息 id 存入 ids_before_sort，
+ 这里还使用了原子操作 atomicAdd，猜测是为了防止有两个 word 的概率一样大的情况下可能由于内存读写竞争导致计算错误。
+ 每轮选出最大值后还根据 word 的位置给排了个序，咱也不知道啥意图。。。
+ 最后把 topK 的位置信息存入 ids 中，注意这里的位置信息仍然是 batch_id、beam_id、word_id，
+ 不过这时候 ids 里面只有 [batch_size, beam_width] 范围内的元素是有效的。*/
 void topK(const float* log_probs, int* ids, const int batch_size, const int beam_width, const int vocab_size,
   cudaStream_t stream)
 {
@@ -383,6 +433,25 @@ void topK(const float* log_probs, int* ids, const int batch_size, const int beam
   topK_kernel_2nd<float><<<1, block, 0, stream>>>(log_probs, ids, batch_size, beam_width * grid.x, beam_width, N);
 }
 
+/*4.10.3 update
+update 函数主要是对累计概率、序列长度、解码 token 等信息根据本次 beam search 的结果进行更新。
+ 更新过程全部在 1 个 block 内完成，
+ block_size 取 batch_size * beam_width，
+ 每个线程内部处理一个样本的一条路径。
+
+ 核函数内首先对 sequence_length 进行更新，如果 finished 标识为 false，sequence_length 长度增加 1，
+ 否则认为当前 step 当前 beam 已经终止了。
+ 然后计算了几个索引的值，beam_id 表示当前线程处理的 topK 路径是属于哪一个 beam。
+ word_id 表示当前线程处理的路径对应的 word 在词表中的位置。
+ 首先将 cum_log_probs 更新到最新，也就是取之前计算的 topK 条路径对应的概率。
+ 更新 sequence_length 为 topK 路径对应的 beam 的长度。
+ 根据 topK 对应的 word_id 是否为 end_id 更新 finished 标识，
+ 这其实就标识下一轮 step 的输入 token 是否是 end_token。
+ 更新 parent_ids 为 beam_id，标识当前这个 topK 路径是从哪个 beam 经过的，
+ 说白了这个变量存储着下一轮 beam 中每个路径是从上一轮哪个 beam 经过的。
+ word_ids 和 output_ids 存储着本轮输出的 topK 个 word 在词表中的位置，
+ 这里的 word_id 在下一轮 step 经过 embedding lookup 之后就变成了了 from_tensor。
+ */
 template <typename T>
 __global__
 void update_kernel(T* log_probs, T* cum_log_probs, 
@@ -413,6 +482,20 @@ void update_kernel(T* log_probs, T* cum_log_probs,
   // int total_finish = reduceSum(fi);
 }
 
+//    4.5 embedding_lookup
+//            顾名思义，embedding_lookup 函数的功能就是把输入 token 从 word_id 映射为词向量，
+//            其实现逻辑就是根据 word_id 去 decoding_params.embedding_table 中查表，把向量存进 from_tensor[0] 中。
+
+/**
+ * @brief 读 word_ids[blockIdx.x] 获取 word_id，embedding_table 的 word_id 行就是词向量
+ *
+ * @tparam T
+ * @param embedding_table           [vocab_size, hidden_size]
+ * @param word_ids                  [batch_size, beam_width]
+ * @param hidden_units
+ * @param from_tensor               [batch_size, beam_width, hidden_size]
+ * @return __global__
+ */
 template <typename T>
 __global__ void embedding_lookup_kernel(const T* embedding_table, const int* word_ids,
     const int hidden_units, T* from_tensor)
@@ -442,6 +525,21 @@ void update(float* log_probs, float* cum_log_probs,
                                                   finished_count);
 }
 
+/**
+ * @brief embedding_lookup
+ *
+ * @tparam T
+ * @param embedding_table               [vocab_size, hidden_size]
+ * @param word_ids                      [batch_size, beam_width]
+ * @param from_tensor   from_tensor[0]: [batch_size, beam_width, hidden_size]
+ * @param batch_size
+ * @param beam_width
+ * @param hidden_units
+ * @param stream
+ *
+ * 通过核函数逻辑可以发现，就是把 word_ids_buf_ lookup 成了 from_tensor_[0]，
+ * 形状为 [batch_size, beam_width, hidden_size]。
+ */
 template <typename T>
 void embedding_lookup(const T* embedding_table, const int* word_ids, T* from_tensor,
   const int batch_size, const int beam_width, const int hidden_units, cudaStream_t stream)
@@ -452,6 +550,36 @@ void embedding_lookup(const T* embedding_table, const int* word_ids, T* from_ten
    embedding_lookup_kernel<<<grid, block, 0, stream>>>(embedding_table, word_ids, hidden_units, from_tensor);
 }
 
+/*4.9 计算 logits
+在深度学习中，logits 的计算一般是通过一个 Dense 层加一个 softmax 激活（二分类中使用 sigmoid，属于 softmax 的特化版本）来实现，
+ 源码中通过一个 cuBLAS API 调用和一个 update_logits 实现。
+ cuBLAS API 实现矩阵乘法，
+ add bias 和 softmax 放在 update_logits 中实现，
+ 下面重点介绍 update_logits 的逻辑。
+
+ * @brief
+ *
+ * @tparam T
+ * @param logits                          [batch_size, beam_width, vocab_size]
+ * @param bias                            [vocab_size,]
+ * @param end_id
+ * @param finished                        [batch_size, beam_width]
+ * @param n                               vocab_size
+ * @return __global__
+
+ 通常我们的词典大小 vocab_size 远大于 1024，
+ 所以 block_size 绝大多数都取 1024，一个 block 处理一行元素的计算，
+ 一个线程会处理多个元素，步长为 blockDim.x。
+
+ 第一个循环体内包含 3 个计算任务：
+ 首先判断当前 step 的 finish flag，若为 true 就把 end_id 的那个分量的 logit 直接设置为最大值，
+ 否则就正常 add bias，最后计算当前线程处理的 logit 的最大值 max_val。
+
+ 然后通过块内规约求出整个 block 内的 max_val 的最大值，
+ 这也是整行 vocab_size 个元素的最大值，
+ 存进共享内存 s_max_val 中。第二、三个循环体分别完成了求指数和以及除以指数和的任务，
+ 最终计算结果取对数就是 LogSoftmax 结果。
+*/
 template <typename T>
 __global__ void update_logits_kernel(T* logits, const T* bias, const int end_id, const bool* finished, const int n)
 {
@@ -463,6 +591,7 @@ __global__ void update_logits_kernel(T* logits, const T* bias, const int end_id,
   __shared__ float s_max_val;
   __shared__ float s_sum_val;
 
+// tid 对应的其实就是 word_id
   for(int tid = threadIdx.x; tid < n; tid += blockDim.x)
   {
     if(finish)
@@ -504,6 +633,16 @@ void update_logits(float* logits, const float* bias, const int end_id, const boo
   update_logits_kernel<float><<<grid, block, 0, stream>>>(logits, bias, end_id, finished, n);
 }
 
+/*
+4.4 init 函数
+这个函数主要实现以下几个功能：
+    decoding_params.sequence_length 初始化为 0
+    finished_buf_ 初始化为 false
+    word_ids 初始化为 start_id
+    cum_log_probs 将 beam_id 为 0 的位置初始化为 0，其他位置初始化为 -lnf
+
+ 初始化完成之后，就开始逐 step 解码了，下面的函数均在 loop for step 中执行。
+ * */
 template <typename T>
 __global__ void init_kernel(bool* finished, int* sequence_length, int* word_ids, T* cum_log_probs, const int sentence_id, const int n, const int beam_width)
 {
@@ -514,6 +653,16 @@ __global__ void init_kernel(bool* finished, int* sequence_length, int* word_ids,
   cum_log_probs[tid] = (T)(tid % beam_width == 0 ? 0.0f: -1e20f);
 }
 
+/*
+前面 3.5.2.3 节中讲过，对于下一轮 step 的 query 来说 self-attention 的 key 是上一轮 step 的输入 token 对应的 tensor 变换后的结果。
+ 由于我们每一轮 beam search 取 topK 会打乱顺序，
+ 直观上咱们并不知道下一轮 topK 分别来源于上一轮哪个 beam，这时候我们就要用上 parent_ids 了，
+ 根据 parent_ids 获取上一轮 step 经过的 beam。
+ 前面讲过，在 Decoder layer 计算的过程中会把当前 beam 的 token 对应的 key 和 value 计算好存入 K_cache_ 和 V_cache_ 中，
+ 现在我们直接根据 beam_id 去取值就可以了，基于双缓存机制，
+ 从 key_cache[src_id] 中取值更新 key_cache[tgt_id]。这块稍微复杂的地方就是 hidden_id 的计算逻辑，
+ 不理解的读者可以结合笔者的这段话多读几遍。
+  */
 template <typename T>
 __global__ void update_KV_cache_kernel(
   T* key_src_cache, T* key_tgt_cache,
@@ -571,7 +720,55 @@ void init(bool* finished, int* sequence_length, int* word_ids, float* cum_log_pr
   init_kernel<float><<<grid, block, 0, stream>>>(finished, sequence_length, word_ids, cum_log_probs, sentence_id, batch_size * beam_width, beam_width);
 }
 
+/*
+4.6 sine_position_encoder
+我们知道 attention 本身是无序的，每个 token 在计算过程中地位都是等同的，为了
+ 表达这种 token 之间的顺序效果，transformer 加入了 Position Encoding layer 给输入 tensor 添加一种位置信息。
+ 原始论文中使用下面的公式来实现位置嵌入：
+        209.png
+可以看到 position encoding 和 token 位置和 hidden 维度奇偶有关，实际计算过程中我们不考虑 hidden 元素的奇偶，
+ 这个维度的顺序本身也没什么意义，所以我们直接前半 hidden_units 使用 sin 后半部分使用 cos，其实 tensorflow api 也是这么简化的，
+ 具体如下：
 
+def positional_encoding(length, depth):
+  depth = depth/2
+  positions = np.arange(length)[:, np.newaxis]     # (seq, 1)
+  depths = np.arange(depth)[np.newaxis, :]/depth   # (1, depth)
+  angle_rates = 1 / (10000**depths)         # (1, depth)
+  angle_rads = positions * angle_rates      # (pos, depth)
+  pos_encoding = np.concatenate(
+      [np.sin(angle_rads), np.cos(angle_rads)],
+      axis=-1)
+  return tf.cast(pos_encoding, dtype=tf.float32)
+
+class PositionalEmbedding(tf.keras.layers.Layer):
+  def __init__(self, vocab_size, d_model):
+    super().__init__()
+    self.d_model = d_model
+    self.embedding = tf.keras.layers.Embedding(vocab_size, d_model, mask_zero=True)
+    self.pos_encoding = positional_encoding(length=2048, depth=d_model)
+
+  def compute_mask(self, *args, **kwargs):
+    return self.embedding.compute_mask(*args, **kwargs)
+
+  def call(self, x):
+    length = tf.shape(x)[1]
+    x = self.embedding(x)
+    # This factor sets the relative scale of the embedding and positonal_encoding.
+    x *= tf.math.sqrt(tf.cast(self.d_model, tf.float32))
+    x = x + self.pos_encoding[tf.newaxis, :length, :]
+    return x
+位置编码示意图如下：
+        210.png
+下面我们来看一下源码，首先给每个元素乘以 根号n  达到缩放效果，然后来计算 ....的部分，
+ 源码可能是为了保证精度和数值溢出考虑，使用先取对数再计算指数的策略将其分解为两部分。
+
+ log_timescale_increment 计算的是...，这里源码中对 half_n 做了略微修正。
+ inv_timescales 计算的是 ....，
+ 随后再乘以 step（也就是pos），得到三角函数里面的内容。
+ 最后根据 tid 判断应该使用正弦还是余弦然后将计算结果加在 tensor 上即可。
+
+ * */
 template<typename T>
 __global__
 void sine_position_encoder_kernel(T* output, int step, int n){
@@ -589,7 +786,16 @@ void sine_position_encoder_kernel(T* output, int step, int n){
   T encoding_val = (tid < half_n) ? (T) __sinf(scaled_time) : (T) __cosf(scaled_time);
   output[bid * n + tid] = output[bid * n + tid]  + encoding_val;
 }
-
+/**
+ * @brief position encoding
+ *
+ * @tparam T
+ * @param output              [m, hidden_units]
+ * @param step
+ * @param m                   batch_size * beam_width
+ * @param n                   hidden_units
+ * @param stream
+ */
 template<typename T>
 void sine_position_encoder(
   T* output,

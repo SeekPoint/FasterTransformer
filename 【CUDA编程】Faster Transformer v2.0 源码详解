@@ -1,0 +1,118 @@
+写在前面：笔者之前对 Nvidia BERT 推理解决方案 Faster Transformer v1.0 版本源码进行了深度剖析，
+详细介绍了源码中的各种优化技巧，文章受到不少读者的肯定。
+应读者之邀，本文将对 Faster Transformer v2.0 版本源码进行解读，
+，除公众号：后来遇见AI 以外，本文也将在知乎进行发布，欢迎各位读者阅读并给出意见。
+
+1 v2.0 版本发布背景
+2019 年 7 月，Nvidia 官方开源了 Nvidia BERT 推理解决方案 Faster Transformer v1.0，针对 B
+ERT 中的 Transformer Encoder 进行优化和加速，以满足在线业务的低延迟要求。
+
+在解决了 Transformer Encoder 的性能问题之后，Nvidia 将重点放到了同样重要的 Transformer Decoder 推理上。
+因此，官方在 FasterTransformer v1.0 版本的基础上，推出了2.0 的版本，增加了针对 Decoder 的优化。
+其优越的性能将助力于翻译，对话机器人，文字补全修正等多种生成式的场景。
+
+简单来说，v1.0 解决了推理过程中 Encoder 部分的性能问题，极大地提升了序列标注等应用场景的推理速度。v2.0
+在此基础上加入了 Decoder 部分的优化，使得 Seq2Seq 场景的推理速度也得到显著改善。
+
+2 整体架构
+同 v1.0 版本一样，v2.0 的底层由 CUDA 和 cuBLAS 实现，支持 FP16 和 FP32 两种计算模式。
+为了兼顾灵活性与效率，官方提供了两个不同大小和效果的模块。
+
+其中，较小的 Decoder 模块主要优化了 Transformer layer 的部分，
+能够提供 2~4 倍左右的加速，相当于我们常说的 decoder layer；
+
+而较大的 Decoding 模块则包含了整个解码的流程，灵活性上较 Decoder 模块稍差，
+但最高能够达到 10 倍以上的加速，相当于我们常说的 decoder model。
+
+201.png
+上图展示了 Decoder 和 Decoding 的差别。
+黄色区块是 Decoder，它包含两个 attention 和一个 feed forward network。
+而蓝色的大区块则是 Decoding，它包含了整个 Decoding 的流程，
+除了 Decoder 外还包括 embedding lookup、sine position encoding、beam search 等等。
+
+总结来看，相比 v1.0来说 v2.0 做了以下的更新:
+    加入了 Transformer Decoder 优化实现。可以支持 Encoder-Decoder 的业务场景。目前 Decoder 可以支持的超参数范围如下:
+        I. Headnumber: 8, 12
+        II. Sizeper head: 64
+        III. Sequencelength: 128 以内
+        IV. Batch size * beam width: 1024 以内
+        V. 字典大小: 64 到 30000 需要注意的是，超参数超出支持范围的情况，我们未验证其性能和正确性。
+    修复 FasterTransformer 1.0 当中的 bug，并且支持 dynamic batch size。
+    代码进行部分部分重构。
+
+另外再明确一点，v2.0 优化的仍然是推理过程的性能，并不是用来加速训练过程的。
+从更新说明可以发现，本次版本更新主要是添加了 Decoder 和 Decoding 两个模块，接下来笔者将分别对这两个模块的源码进行解读。
+源码地址如下，有兴趣的读者可以前往下载：
+https://github.com/NVIDIA/FasterTransformer/tree/v2.0/
+
+3 Decoder模块
+3.1 计算框架
+前面说过 Decoder 模块实际就是一个单层的解码 layer 的实现，
+宏观上包含两个 multi-head attention layer 和 一个 ffn layer，
+细节上 layer 与 layer 之间还加入了残差结构和层归一化等操作，具体计算逻辑如下图：
+202.png
+整体结构可以分成 7 个步骤，其中，橘色外框的 mask multi-head attention 可以在拆成 5 个核函数，
+cross multi-head attention 可以在拆成 3 个核函数，FFN 也可以再拆成 3 个核函数。
+
+3.2 调用链
+Decoder 模块的核心逻辑封装在 open_decoder.h 文件的 OpenDecoder 类中，计算逻辑都在 forward 函数里，具体调用链如下：
+    OpenDecoder->initialize()
+    OpenDecoder->forward()
+       ->decoder_norm1
+       ->masked_multi_head_attention
+       ->decoder_norm2
+       ->cross_multi_head_attention
+       ->decoder_norm2
+       ->ffn
+       ->add_bias_input
+7 个函数对应结构图中 7 个步骤，下一面将对 7 个函数源码进行一一解读。
+
+
+
+
+4 Decoding 模块
+根据第 2 节的结构图可以看到，Decoding 模块除了包含 Decoder 模块以外，
+还有 embedding lookup、position encoding、compute log probability 以及 beam search 等模块，
+包含了整个解码环节。
+
+4.1 调用链
+Decoding 模块的核心逻辑封装在 decoding_opennmt.h 文件的 DecodingOpenNMT 类中，
+主要的计算逻辑都在 forward 函数里，具体调用链如下：
+        DecodingOpenNMT->DecodingOpenNMT()  // 构造函数
+        DecodingOpenNMT->forward()
+            ->init()
+            ->loop for step
+                ->embedding_lookup()
+                ->sine_position_encoder()
+                ->loop for decoder layer
+                    ->decoder->initialize()
+                    ->decoder->forward()
+                ->decoder->decoder_norm1()
+                ->cublasGemmEx
+                ->update_logits()
+                ->BeamSearch_OpenNMT()
+
+5 小结
+至此，整个 Faster Transformer v2.0 源码逻辑均已解读完毕，总结如下：
+        访存带宽方面，建议加入向量化访问的机制，可以有效提升性能。
+
+        发现一个小问题，源码作者经常会使用一些不必要的共享内存，比如经常存一些 s_max、s_sum 这种变量，
+        其实在规约之后线程内部已经获取到块内规约值了，
+        又不涉及线程之间的通信，
+        没有必要舍弃更快的寄存器用共享内存，
+        这块算是官方源码作者的一个编程小习惯。
+
+        感觉 topK 的求解过程略微繁琐，应该可以优化。
+        而且这块作者的意图笔者理解不够透彻，
+        直观上感觉部分代码有些冗余，
+        期待熟悉的读者给与指导和解惑。
+
+        源码 beam search 的部分，需要细读才能理解，
+        也是整个源码中较为难懂的部分。
+
+        申请 K_mem_cache_ 和 V_mem_cache_ 内存的时候有个小 bug，
+        官方已在 v2.1 版本修复。
+        
+本文使用 Zhihu On VSCode 创作并发布
+
+发布于 2023-08-16 19:04・IP 属地上海

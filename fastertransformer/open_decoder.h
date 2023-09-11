@@ -28,6 +28,7 @@
 namespace fastertransformer
 {
 
+    //param 内包含了 decoder layer 中的权重参数，包含 layerNorm 层、attention 层、ffn 层等，可以看一下源码。
 template <typename T>
 class DecoderInitParam
 {
@@ -169,12 +170,36 @@ public:
     return 12 * buf_size;
   }
 
+/**
+ *     3.3 initialize
+            在执行 forward 之前，需要先调用 initialize 函数进行初始化处理，该函数接收两个参数 param 和 buf。
+
+ 笔者根据源码绘制了一份内存分布图如下：
+203.png
+param 内包含了 decoder layer 中的权重参数，包含 layerNorm 层、attention 层、ffn 层等，可以看一下源码。
+
+buf 是从外部传进来的一个设备内存上的指针，表示 decoder layer 数据的起始位置，
+ 在函数内部通过偏移量来确定各个变量的起始地址，内存分布如上图。
+
+ 另外说一下，关于 decoder layer 的 batch_size_ 参数，
+ 实际调用中是通过构造函数初始化的，在 DecodingOpenNMT 的构造函数中 new 了一个 decoder_，
+ 使用 batch_size * beam_width 初始化了 decoder layer 中的 batch_size_ 参数。
+
+ 也就是说，Decoder 模块中的 batch_size_ 实际是 batch_size * beam_width，
+ 不过我们现在只讨论 Decoder 的计算逻辑，可以就把他当 batch_size 来看，这并不影响计算。
+
+  * @brief decoder layer 初始化
+  *
+  * @param param 当前 layer 的所有权重参数，包含layerNorm层、attention层、ffn层等
+  * @param buf decoder_buf_
+  */
+
   void initialize(DecoderInitParam<DataType_> param, DataType_ *buf)
   {
 #ifndef NDEBUG
     PRINT_FUNC_NAME_();
 #endif
-    param_ = param;
+    param_ = param; //param 内包含了 decoder layer 中的权重参数，包含 layerNorm 层、attention 层、ffn 层等，可以看一下源码。
     int buf_size = batch_size_ * hidden_units_;
     norm_from_tensor_buf_ = buf;
     query_buf_ = buf + buf_size;       //store the query values (from_tensor * Q) in both masked and multi-head attention
@@ -188,6 +213,19 @@ public:
     ffn_inner_buf_ = buf + 7 * buf_size;         //4 buf size to store inner product
   }
 
+  /**
+   * @brief
+   *
+   * @param from_tensor                     [batch_size_, hidden_units_]
+   * @param memory_tensor
+   * @param key_cache_                      [cache_size, ] = [batch_size_, seq_len, hidden_units_]
+   * @param value_cache_                    [cache_size, ] = [batch_size_, seq_len, hidden_units_]
+   * @param key_mem_cache_                  [cache_size, ] = [batch_size_, seq_len, hidden_units_]
+   * @param value_mem_cache_                [cache_size, ] = [batch_size_, seq_len, hidden_units_]
+   * @param memory_sequence_length
+   * @param decoder_output
+   * @param step
+   */
   void forward(const DataType_ *from_tensor, const DataType_ *memory_tensor,
                DataType_ *key_cache_, DataType_ *value_cache_,
                DataType_ *key_mem_cache_, DataType_ *value_mem_cache_,
