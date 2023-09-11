@@ -109,6 +109,39 @@ class OpenMultiHeadAttention: IMultiHeadAttention<OpType_>
     int qk_buf_size = batch_size_ * head_num_ * from_seq_len_ * from_seq_len_;
     try
     {
+        /*5 内核优化
+            5.1 批量矩阵乘法优化
+            首先我们来看 Encoder 部分的优化点，Encoder 的计算较为简单，
+         主要集中在 self-attention。
+         在介绍 OpenMultiHeadAttention 之前我们不妨先来看一下其内部 buffer 的内存分布情况，
+         通过内存分布情况的变化，
+         可以看出具体新增和删减了哪些变量，从这些变量入手可以有助于弄懂具体优化逻辑。
+
+         从 OpenMultiHeadAttention 构造函数中可以发现，
+         v2.1 版本多申请了 sizeof(DataType_*) * 9 大小的设备内存，
+         也就是说多了 9 个二级指针。从下面内存分配可以看出，
+         这 9 个二级指针分别分给了 3 个变量：qkv_kernel_、qkv_input_、qkv_buf_。
+         这三个变量在 initialize 进行初始化，
+         其中 qkv_kernel_ 对应 self-attention 操作中对输入 tensor 进行线性变换的 3 个权重参数；
+         qkv_input_ 对应 3 个输入 tensor，
+         在 self-attention 中全部都是 from_tenosr；
+         qkv_buf_ 对应的是 3 个 buffer，用于存储 Q\K\V 的中间计算结果。
+
+
+         仔细一想，这三个新增变量最终指向的数据其实都是前面已经存在的变量，为什么要单独搞这几个二级指针呢，
+         而且这几个变量统统都和 self-attention 相关？这应该是 self-attention 中使用了某个 API，
+         通过这个 API 可以获得加速效果，其输入参数要求是二级指针。
+
+        果不其然，forward 函数中当 is_fuse_QKV 为 true 时，
+         调用了 cuBLAS 中的 cublasGemmBatchedEx 函数进行矩阵乘法，
+         该函数可以对 batch 级别的矩阵进行乘法运算，
+         要求输入的参数为 Array of pointers to <Btype> array 也就是二级指针的形式，
+         这里源码把 query、key、value 三个矩阵当成一个 batch 内的三个矩阵，
+         使用 API 一次完成 3 个矩阵的乘法运算，
+         相比与原来的先后调用三次 cublasGemmEx 函数计算乘法，节省了一定的运算时间。
+
+         关于批量矩阵乘法这个优化除了 Encoder 以外，在 Decoder 的 self-attention 中也有应用，具体各位读者可以自行阅读。
+         */
       buf_ = (DataType_*) allocator_.malloc(sizeof(DataType_) * (buf_size * 7 + qk_buf_size) + sizeof(DataType_*) * 9);
       query_buf_ = buf_;
       key_buf_ = buf_ + buf_size;

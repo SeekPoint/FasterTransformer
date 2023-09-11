@@ -187,6 +187,19 @@ void add_QKV_bias(half* Q, const half* bias_Q, half* K, const half* bias_K, half
   dst_ptr[target_id] = __hadd2(src_ptr[tid],  __ldg(&bias_ptr[bias_id]));
 }
 
+/*3.4.2 add_QKV_bias_rebuild_padding
+顾名思义，核函数内部实现了两个计算逻辑：add Q/K/V bias 和恢复填充值，我们来看下源码。
+
+ 核函数 grid_size 设置为 valid_word_num，一个 block 内部处理 hidden_uints = head_num*size_per_head 个元素。
+ 由于模型整体超参数要求 hidden_uints 不大于 1024，所以这里 block_size 直接就设置为 hidden_units，一个 thread 就处理一个元素。
+核函数内部最重要的逻辑就是 tgt_id 的计算，有两点需要把握。
+ 首先是 tgt_batch_id 和 tgt_seq_id 的确定，通过源矩阵的索引加偏移量后计算得到。
+ 然后是 tgt_id 的确定，按照 [batch_size, head_num, seq_len, size_per_head] 的顺序计算即可。
+不熟悉 attention 计算逻辑的读者可能会问，为什么就加了一个 add bias 的操作，核函数变得如此复杂？
+ 这其实是因为这里面其实还隐藏了一个 transpose 操作，
+ 把原来形状如 [valid_word_num, head_num, size_per_head] 的矩阵转换成了形状如 [batch_size, head_num, seq_len, size_per_head] 的矩阵，
+ 笔者在前面的文章说过，这是“多头”独立计算的逻辑使然。
+ */
 template<typename T>
 __global__
 void add_QKV_bias_rebuild_padding(T* Q, const T* bias_Q, T* K, const T* bias_K, T* V, const T* bias_V, T* q_buf_, T* k_buf_, T* v_buf_, 
@@ -460,7 +473,21 @@ void transpose(half* src, half* dst,
   dst_ptr[target_id] = src_ptr[tid];
 }
 
+/*
+ 3.2.2 transpose_rebuild_padding
+关于这个函数名的问题笔者前面已经吐槽过了，到此为止，这并不影响实际应用，不然也没法通过测试上线。。。
+ 这个函数内部实现了两个操作：transpose、删除填充值，
+ 下面来看一下代码。
 
+ 函数体内部有两行关于 bid 和 tid 的注释，这个是源码作者的注释，应该是写混了，不用去看，请听笔者一一解释。
+首先这个函数的应用场景是在  softmax QK^T/ 根号dk  之后，也就是说这里的源矩阵是转置之后的矩阵，
+ 形状为 [batch_size, head_num, seq_len, size_per_head]，
+ 计算目的有两个：transpose、和删除填充值。
+ gird_size 设置为 valid_word_num，block_size 设置为 head_num * size_per_head，一个 thread 处理一个元素。
+ 函数内部通过偏移量确定源矩阵的 batch_id 和 seq_id，
+ 有了索引后，再按照矩阵维度顺序把形如 [batch_size, head_num, seq_len, size_per_head] 的源矩阵，
+ 转换为形如 [valid_word_num, head_num, size_per_head] 的无填充矩阵。
+ */
 template<typename T>
 __global__
 void transpose_rebuild_padding(T* src, T* dst, const int batch_size, const int seq_len, const int head_num, const int size_per_head,

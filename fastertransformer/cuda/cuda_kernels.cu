@@ -423,6 +423,19 @@ __global__ void update_logits_kernel(T* logits, const T* bias, const int end_id,
   }
 }
 
+/*
+4.7 Top-k 采样解码
+前面说过 Top-k 采样解码是先选取概率最大的 k 个 word 再进行采样，所以需要先计算概率，
+ 计算概率必然要先根据 logits 值计算 Softmax，但是我们知道 Softmax 函数是单调的，其实就相当于一个指数映射后的归一化操作。
+ 那既然是单调函数，我们完全可以直接根据 logits 直接选出 TopK，然后再计算 Softmax，
+ 这样可以把 Softmax 的规模从 vocab_size 缩减到 k，这是一个非常可观的缩减量。
+
+4.7.1 update_logits_without_softmax
+这个核函数完成了 logits 的 add bias 操作，其实是 decoder out 的线性变换的内容，
+ 前面只进行了矩阵乘法，在这个核函数中把偏置项加上，另外核函数内部还加了一个停止符判断。
+
+ 这里加完偏置项就可以直接用于 TopK 采样了。
+ * */
 template <typename T>
 __global__ void update_logits_kernel_without_softmax(T* logits, const T* bias, const int end_id, const bool* finished, const int n)
 {
@@ -482,6 +495,21 @@ __global__ void update_logits_kernel_without_log(T* logits, const T* bias, const
   }
 }
 
+/*
+3.2 删除填充值
+以形状为 [batch_size, seq_len, hidden_units] 的 tensor_padded 矩阵为例，
+ 如果计算过程只是在最后一个维度，比如右乘一个形如 [hidden_uints, new_units] 的矩阵，
+ 那其实完全可以去掉 tensor_padded 中的填充值之后再计算。
+ 这里官方提供了两个核函数进行删除填充值的操作：
+ 第一个就是单纯的删除填充值函数 remove_sequence_length_padding_kernelLauncher，
+ 第二个是和 transpose 操作融合后的 transpose_rebuild_padding，读者看起来可能会一脸懵逼，
+ 为什么删除函数命名要用 rebuild？
+ 没错，这里应该是源码作者笔误，导致了挂羊头卖狗肉的行为。
+
+3.2.1 remove_sequence_length_padding_kernelLauncher
+单纯地删除填充值的计算逻辑很简单，就是按两步，找到行索引，
+ 按索引拷贝元素即可，直接看代码。
+ * */
 template<typename T>
 __global__ void remove_sequence_length_padding(const T* src, T* tgt,
                                               const int* tmp_mask_offset,
@@ -512,6 +540,26 @@ void remove_sequence_length_padding_kernelLauncher(const T* src, T* tgt,
   remove_sequence_length_padding<<<m, 256, 0, stream>>>(src, tgt, tmp_mask_offset, mask_offset, n);
 }
 
+/*
+3.4 恢复填充值
+我们知道，attention 操作通常包括：Q/K/V 线性变换、 softmax (QK^T/ 根号dk )*V 、transpose 以及 attention out 线性变换等几个步骤。
+ 其中  softmax (QK^T/ 根号dk )*V  中有 2 个 Strided Batched Gemm 操作，
+ 这两个矩阵乘法是涉及 seq_len 维度的，
+ 因为要计算 word 与 word 间的相似度以及 scores 的加权平均值，所以在计算前要先恢复填充值矩阵。
+ 这里有一点要说明，并不是说这一步计算必须得有填充值，是因为有了填充值可以调用矩阵乘法 API，
+ 从而实现更好的并行化计算，如果舍弃矩阵乘法写一个函数根据偏移量逐个 word 计算，
+ 也是可行的，但是性能极差，所以还不如动态恢复矩阵。
+关于恢复填充值的操作，源码提供了两个 kernel，
+ 第一个就是单纯的恢复填充值函数 rebuild_sequence_length_padding_kernelLauncher，
+ 第二个是和 add bias 操作融合后的 add_QKV_bias_rebuild_padding。
+
+3.4.1 rebuild_sequence_length_padding_kernelLauncher
+恢复填充值的操作和删除填充值的操作是互逆的，只需要把握一点即可：
+ ROW_padded = row +id_offset
+
+ 核函数执行配置参数与删除填充值的核函数一致，都是一个 block 处理一行元素。
+ 可以看到，源矩阵中的行索引 tgt_seq_id 就等于目标矩阵的行索引 src_seq_id 加上 offset。
+ * */
 template<typename T>
 __global__ void rebuild_sequence_length_padding(const T* src, T* tgt,
                                             const int* mask_offset,
@@ -559,6 +607,33 @@ __global__ void build_sequence_length_padding_offset(const int* sequence_length,
   valid_word_num[0] = total_seq_len;
 }
 
+/*
+3.1 计算偏移量
+通常上游传过来的 tensor 一般是 padded 之后的规则矩阵，假设形状为 [batch_size, seq_len, hidden_units] 记为 tensor_padded，
+ 删除填充值后的形状为 [valid_word_num, hidden_units] 记为 tensor，要想动态的删除和恢复填充值，
+ 也就是说要找到 tensor_padded 和 tensor 的对应关系，
+ 源码中用 build_sequence_length_padding_offset_kernelLauncher 函数解决这个问题。
+
+ 可以看到函数体内部执行了一个 1*1 的核函数，也就是说这个核函数完全没有并行，全部逻辑在一个线程里完成。
+ 可能有读者要问，既然不并行，那为啥不在主机端直接用 C++ 完成，
+ 这是因为 tmp_mask_offset 和 valid_word_num 这都是设备端的变量，
+ 如果在主机端计算还需要一次内存拷贝操作，
+ 而 host-device 内存拷贝是比较耗时的，所以干脆就在设备端开一个线程算了。
+核函数内的计算逻辑比较简单，直接看下面的图就可以了。
+     2102.png
+根据样本长度 sequence_length 计算了两个指标 valid_word_num 和 id_offset，
+ 用于后面动态删除和恢复矩阵，tensor 的行索引加上 id_offset 就得到了对应行在 tensor_padded 中的行索引。
+/**
+ * @brief 计算偏移量
+ *
+ * @param sequence_length         [batch_size,]
+ * @param batch_size
+ * @param max_seq_len
+ * @param valid_word_num          [1,]
+ * @param tmp_mask_offset         [valid_word_num]
+ * @return __global__
+ */
+    * */
 void build_sequence_length_padding_offset_kernelLauncher(const int* sequence_length, 
   const int batch_size, const int max_seq_len, int* valid_word_num, int* tmp_mask_offset,
   cudaStream_t stream)

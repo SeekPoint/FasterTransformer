@@ -28,7 +28,23 @@ const bool ATTENION_OPT = true;
 const int ATTENTION_BLOCK_SIZE = 256;
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
+/*
+5.2 Decoder Attention Opt
+Decoder 的两个核函数 masked_attention_kernel_opt、 cross_attention_kernel_opt 的优化是 decoder 中的主要优化内容，
+ 笔者将以 masked_attention_kernel_opt 为例介绍优化技巧，关于 attention 的原理等内容不再赘述。
+ 这部分代码实现过程说实话有些繁琐，会导致初读的时候一脸懵逼，总之优化思路就一
+ 句话：向量化数据访问提升带宽。
 
+5.2.1 向量化数据类型
+首先作者定义了一个数据类型 Copy_t，这个类型的定义过程也比较繁琐，
+ 其内存占用的大小是根据 ELEMENTS_PER_WARP_LOAD 动态调整的，具体代码如下：
+
+ 源码中使用的 std::conditional 是 C++11 引入的类模板，表示的是一种编译期的分支逻辑，
+ 当第一个非类型模板参数的值为 true 时，type 的类型为第一个类型模板参数的类型，
+ 为 false 时 type 的类型为第二个类型模板参数的值。
+ 那么以上代码的含义就是在一个 warp 内处理 ELEMENTS_PER_WARP_LOAD 个 T 类型的元素，
+ Copy_t 类型占用的大小为 sizeof(T) * ELEMENTS_PER_WARP_LOAD / 32。
+  */
 template <int HALF_ELEMENTS_PER_WARP_LOAD>
 using Copy_half_t =
     typename std::conditional<HALF_ELEMENTS_PER_WARP_LOAD == 32, half,
@@ -160,6 +176,27 @@ T blockReduceMax(T val)
   return val;
 }
 
+/*
+这里我们假设数据类型 T 以 FP32 为例，
+ELEMENTS_PER_WARP_LOAD 设置为 size_per_head 取 64，
+这样的话 Copy_t 实际就是 int2 类型，
+不要去纠结为什么是 int2，
+这里写 int2 仅仅是因为他占了 8 个字节，
+写 float2 等任意占用 8 个字节的类型也是一样的。
+带着这个向量化访问的思想，
+我们再来看一下核函数 masked_attention_kernel_opt 的代码，
+代码太繁琐我就不完整贴了，下面只对主要内容进行介绍。
+
+ 首先提一下核函数的 gird_size 和 block_size 分别设置为 batch_size * head_num 和 256，
+ 也就是一个 block 内处理一行数据（size_per_head个元素）。
+ 在核函数内部定义了一个类型 copy_t，从模板参数可以看出，
+ 这里是想要一个 Warp 内部直接处理 size_per_head 个元素的，
+ 也就是说在这一个 block 内一个 warp 就完成了当前 step 的计算任务，其他 warp 在干嘛？
+ 后面将会讲到。
+ 然后定义了一个变量 elems_per_thread 表示每个线程处理的元素数量。
+ 接着定义了一个联合体 Access_t 用来存储 elems_per_thread 个 T 类型的元素，
+ 和一个结构体 Float_n_t 用来存储 n 个 T 类型的元素。
+*/
 template <int size_per_head, int block_sz, typename T>
 __global__ 
 void masked_attention_kernel_opt(
@@ -182,6 +219,8 @@ void masked_attention_kernel_opt(
     T x[elems_per_thread]; // supported size 1,2,4
   } float_n_t;
 
+//    5.2.2 add query bias
+//    核函数内定义了两个变量 sq 和 logits，用来存储 attention 的中间结果。
   __shared__ float_n_t sq[block_sz];
 
   __shared__ float logits[1024]; // only use [0 ~ step-1], the step should be smaller than 1024
@@ -216,6 +255,15 @@ void masked_attention_kernel_opt(
   Access_t key_val_r, key_buf_r;
   Access_t value_val_r, value_buf_r;
 
+//在 add query bias 之前先计算了当前线程的各类索引以及偏移量 qkv_id，
+//结合线程网格这个很好理解，
+//然后根据偏移量更改了 Q\K\V 相关的各个变量的地址方便后续索引。
+//计算 add query bias 的过程分为两步：
+//从 query_buf 和 self_Q_bias 中向量化取值、结构体内循环计算。
+
+//        可以看到联合体 Access_t 中的成员 v，其实就起到一个方便占位的作用，当然如果没有的话，笔者认为也可以使用下面的方式取值。
+//        Access_t *qbuf = reinterpret_cast<Access_t>(query_buf)
+//        query_buf_r.v = qbuf[lane_id];
   // each warp will have its own copy of sq
   query_buf_r.v = *((copy_t *)query_buf + lane_id);
   key_buf_r.v = *((copy_t *)key_buf + lane_id);
@@ -226,6 +274,22 @@ void masked_attention_kernel_opt(
     qb_r[i] =  (float)query_buf_r.x[i] + (float)bias_r.x[i];
   }
 
+  /*
+5.2.3 add key bias & softmax
+我们知道 attention 中 softmax 计算的对象是 query 和 key 的乘积，query 我们已经拿到了，
+   存在每个 thread 的 qb_r 中。key 需要从 key_cache 中获取，
+   对于当前 step 而言，query 是固定的，
+   与 from_tensor 对应，key 与前面 step 的 from_tensor 也一一对应，
+   因此这一步完全是可以并行的，所以作者在这里设计成一个 block 内总共处理 warp_num 个 step 的计算，
+   这也回应了前面的疑问，明明一个 warp 内就能处理一个 step 的计算，其他 warp 干啥去了。
+   其他 warp 处理其他 step 的计算去了。
+   总结一下，对于所有 warp 而言 query 都是一样的，所以放在寄存器变量 qb_r 中，
+   同时每个 warp 有各自的 key，通过 ite * offset 计算偏移量获取。
+
+
+拿到 key 之后将其与 query 相乘然后调用 cub 库的束内规约 API 计算出每个 step 下 query 和 key 的向量相似度也就是 attention scores，
+   根据 step 的索引 ite 将其存入 logits 中。
+   * */
   //offset for each step
   int offset = batch_size * head_num * size_per_head;
   bias_r.v = *((copy_t *) self_K_bias + lane_id);
@@ -254,6 +318,8 @@ void masked_attention_kernel_opt(
   }
   __syncthreads();
 
+//        计算 Softmax 的过程比较常规，就是三个步骤：reduceMax、broadcast、reduceSum、broadcast，
+//        没什么好说的，有疑问的读者可以阅读笔者上一篇文章。
   __shared__ float s_max_val, s_sum;
 
   float local_i = -1e20f;
@@ -285,6 +351,21 @@ void masked_attention_kernel_opt(
   }
   __syncthreads(); 
 
+  /*
+ 5.2.4 计算 attention
+得到 attention scores 后，右乘一个 value 矩阵就得到 attention out，其实就是算加权平均值。这里计算思路也和前面计算
+大致相同，都是一个 block 内计算 warp_num 个 step，计算完成后 sum_r 中存储了每个线程负责的 step 的对应元素的加权和，
+最终的是需要所有 step 的加权总和，所以作者把 sum_r 放入共享内存变量 sq 中暂存，
+然后再进行两层循环把其他线程束计算的 sum_r 全都加到 warp_id == 0 的线程对应的 sum_r 中，
+此时 warp_id == 0 的线程束内各 thread 中的 sum_r 存储的即为完成加权求和之后的 attention out，
+最后将 attention out 更新到 context_buf_ptr 中完成计算。
+
+这里有一点需要注意，在把其他线程束计算的 sum_r 更新到 0 号线程束内时，
+   源码中使用 sq[j * WARP_SIZE + tid] 进行取值，
+   这里容易造成误解，虽然在 0 号线程束内 lane_id 和 tid 的值相等，
+   但是为了便于理解这里建议还是使用 sq[j * WARP_SIZE + lane_id] 取值较好，
+   以免对不熟悉的读者造成困扰。
+   * */
   // This optimization introduces discrepancy because of different order in FP32 summation
   float sum_r[elems_per_thread] = {0.f};
   bias_r.v = *((copy_t *) self_V_bias + lane_id);

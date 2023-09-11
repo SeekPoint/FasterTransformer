@@ -65,7 +65,26 @@ namespace fastertransformer
                                                   batch_size * beam_width, 
                                                   beam_width);
   }
+/*
+4.6 embedding_lookup_sine_position_encoding_kernel_launcher
+该核函数做了两项工作：词嵌入（embedding lookup）、位置嵌入（sine_position），
+ 在 v2.0 版本这俩功能是通过两个核函数实现的，
+ v2.1 版本把这两个核函数进行了融合，
+ 这块内容本来笔者是计划放在第 5 节来介绍的，
+ 但是为了保证采样模块的完整性，就先在这里说了。
 
+ 核函数的 grid_size 和 block_size 分别设置为 batch_size 和 hidden_units，在函数内部做了以下三件事：
+
+根据 embedding_table 查表赋值，把 word_id 转化为词向量
+
+词向量的值乘以一个修正系数 hidden_uints ** 0.5，达到缩放效果，
+ 这一步在 v2.0 版本中是在 sine_position_encoder_kernel 核函数中进行的。
+
+加上位置编码向量，在 v2.0 版本的 sine_position_encoder_kernel 中是直接计算了一个位置编码值加上去的，
+ 但是这里为了节省计算时间，直接通过查表实现，这就要求函数入参的时候把提前计算好的 position_encoding 传进来，
+ 这种做法其实挺好的，因为本身位置编码就是与数据无关的，完全可以提前算好，
+ 缺点就是会增加内存占用，用空间换时间。
+ * */
   template <typename T>
   __global__ void embedding_lookup_sine_position_encoding_kernel(T* from_tensor,
                                                                 const T* embedding_table, 
@@ -319,7 +338,50 @@ namespace fastertransformer
 
   /* *************************** end of BeamSearch kernel *********************************** */
 
+
+
   /* ********************************** Sampling kernel *********************************** */
+
+/*
+4.5.1 Top-k 采样初始化
+Top-k 采样初始化时依然调用的是 v2.0 版本的 DecodingOpenNMT 中的 init_kernel 核函数，
+只是把 beam_width 设置为 1 表示不使用 beam search，这个函数主要实现以下几个功能：
+
+        decoding_params.sequence_length 初始化为 0
+
+        finished_buf_ 初始化为 false
+
+        word_ids 初始化为 start_id
+
+        cum_log_probs 初始化为 0
+
+4.5.2 Top-p 采样初始化
+Top-p 采样初始化主要做了以下工作：
+
+        decoding_params.sequence_length 初始化为 0
+
+        finished_buf_ 初始化为 false
+
+        word_ids 初始化为 start_id
+
+        topp_offset_buf 初始化为 [0, vocab_size, ..., batch_size * vocab_size]
+
+        topp_id_val_buf 初始化为 [[0, 1, ..., vocab_size-1], [0, 1, ..., vocab_size-1], ..., [0, 1, ..., vocab_size-1]]，
+        其实就是 batch_size 个索引向量。
+/**
+* @brief top-p 初始化
+*
+* @param finished                  [batch_size,]
+* @param sequence_length           [batch_size,]
+* @param word_ids                  [batch_size,]
+* @param topp_id_val_buf           [batch_size, vocab_size]
+* @param topp_offset_buf           [batch_size + 1 向上取 4 的倍数, ]
+* @param batch_size
+* @param vocab_size
+* @param start_id
+* @return __global__
+*/
+ * */
   __global__ void topp_initialization_kernel(bool* finished,
                                           int* sequence_length, 
                                           int* word_ids,

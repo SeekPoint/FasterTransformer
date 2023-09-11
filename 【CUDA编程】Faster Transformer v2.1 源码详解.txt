@@ -1,0 +1,164 @@
+【CUDA编程】Faster Transformer v2.1 源码详解
+https://zhuanlan.zhihu.com/p/654368698
+
+
+写在前面：本文将对 Faster Transformer v2.1 版本源码进行解读，
+重点介绍该版本基于 v1.0 和 v2.0 所做的优化内容，剖析源码作者优化意图，
+为了便于交流讨论，除公众号：后来遇见AI 以外，本文也将在知乎进行发布，欢迎各位读者阅读并给出意见。
+
+1 v2.1 版本发布背景
+在 FasterTransformer v1.0 中，Nvidia 提供了一个高度优化的 BERT Transformer Encoder 模块，
+主要应用于序列标注推理场景，笔者针对源码的实现逻辑和优化技巧进行了深度剖析，
+有兴趣的读者可以移步——【CUDA编程】Faster Transformer v1.0 源码详解。
+
+在 FasterTransformer v2.0 中，Nvidia 添加了一个高度优化的 Decoder 模块和一套推理方案 Decoding 模型。
+其中，Decoder 相当于我们常说的 decoder layer；
+而 Decoding 则包含了整个解码的流程，包括词嵌入、位置编码、解码层和束搜索等过程，相当于我们常说的 decoder model。
+同样，笔者针对 v2.0 版本新增的内容进行了优化解读，有兴趣的读者可以移步——【CUDA编程】Faster Transformer v2.0 源码详解。
+
+在 FasterTransformer v2.1 中，官方主要添加了 3 块优化内容。
+
+    第一点是考虑到 PyTorch 的用户越来越多，官方添加了对 PyTorch 的支持，这点不在本文的讨论范畴。
+    第二个特点是支持 Effective Transformer，该优化思路来自字节跳动算法团队，计算模型中去除了 encoder 输入的无效填充，从而降低了计算开销。
+    第三，除了使用束搜索进行解码外，还提供了基于采样的解码策略。
+
+除此之外，Nvidia 还对 Encoder、Decoder 和 beam search 等诸多模块的内核进行了优化，进一步提高了 FasterTransformer 的推理速度。
+因此本文的解读也主要聚焦于 3 个方面：Effective Transformer、sampling decoding、内核优化，
+针对其他未发生变更的内容，请读者阅读笔者的前两篇文章。
+
+2 整体架构
+同前面两个版本一样，v2.1 的底层由 CUDA 和 cuBLAS 实现，提供 C++ API 和 TensorFlow/PyThorch OP。
+用户可以将它们集成到 TensorFlow、PyTorch 或其他在本机 C++ 中构建的推理服务代码中。
+此外官方还提供了一些简单的示例代码来演示如何使用 Encoder、Decoder 以及在 C++、TensorFlow 和 PyTorch 中执行 Decoding 过程。
+下面是整体架构图：  2101.png
+
+源码地址如下，有兴趣的读者可以前往下载：
+https://github.com/NVIDIA/FasterTransformer/tree/v2.1/
+
+3 Effective Transformer
+关于 Transformer Encoder 的逻辑笔者在之前的文章中有详细阐述，这里笔者不打算再重复讲解，解读重心会放在“Effective”的部分。
+
+当使用 Transformer 对一批输入序列进行编码时，我们通常将输入序列视为一个矩阵，其列数等于所有序列的最大长度。
+Faster Transformer 可以非常有效地处理所有序列长度大致相同的情况。
+然而，如果同一批中序列的长度变化很大，将它们填充到相同的长度意味着对内存和计算资源的巨大浪费。
+
+考虑下面一个例子：
+
+    bert_input = [["Hi"], ["Picking"], ["The", "seed", "of", "Job's", "tears"]]
+    bert_tokens = [[1], [2], [3,4,5,6,7]]
+    bert_tokens_padded = [[1, 0, 0, 0, 0], [2, 0, 0, 0, 0], [3, 4, 5, 6, 7]]
+    bert_tokens_mask = [[1, 0, 0, 0, 0], [1, 0, 0, 0, 0], [1, 1, 1, 1, 1]]
+
+对于输入的 3 个样本来说，实际有效的 word 只有 1+1+5=7 个，
+但是我们要用一个 3 * 5 的矩阵来计算，中间其实有一半的元素是无效的，这些无效元素既浪费了内存又占用了计算资源。
+所以我们在想，能不能就用 [1,2,3,4,5,6,7] 这 7 个元素来参与计算？
+在 Effective Transformer 中，会根据不同的计算阶段，动态删除和恢复填充值，从而减少资源占用。
+
+
+4 采样解码
+4.1 采样解码原理
+关于解码策略，笔者在上一篇文章中介绍了贪心搜索（greedy search）和束搜索（beam search）两种方法，
+这两种方法统称为基于搜索的解码策略，其解码目标都是最大化生成概率，
+即高概率的 word 相比于低概率 word 有压倒性优势，在解码过程中低概率的 word 绝不可能被选中。
+
+除了基于搜索的解码策略以外，基于概率采样的解码策略也被广泛应用，
+相比基于搜索的解码方法，通过采样生成的文本通常具有更高的多样性，同时也在一定程度上缓解了生成通用和重复文本的问题。
+常用的基于概率采样的解码策略分为以下四种：
+随机采样、带温度的随机采样、Top-k 采样、Top-p 采样。
+
+4.1.1 随机采样
+在解码时每个 step 都从当前概率分布 P(y| Y_t, X) 中按照概率随机采样一个词，即 ^y ~ P(y| Y^_t, X)。
+相比于按概率“掐尖”，这样会增大所选词的范围，引入更多的随机性。
+这个方法是谷歌开放式聊天机器人 Meena[DialoGPT、Meena] 采用的方式。
+当时那篇论文的结论就是这种随机采样的方法远好于 Beam Search。
+但这种随机采样也是有局限性的，容易产生上下文无关前后不一致的问题。
+而在开放闲聊领域，生成文本的长度都比较短，这种问题就被自然的淡化了。
+
+4.1.2 带温度的随机采样
+尽管随机采样在一定程度上能避免生成重复的文本，但是，由于从整个词表中采样可能会采到与上下文无关的词，因此，随机采样得到的文本上下文常常不连贯。
+为了使得模型尽可能避免采样到低概率的词，一个有效的办法是设置一个名为“温度”（temperature）的参数来控制概率分布的弥散程度，
+该参数用 T 表示，是一个大于 0 的实数。形式化地说，生成过程中需要将概率分布的计算方式修改为：
+ P(y| Y_t, X)  = softmax(logit S_t / T ) | y
+当 T=1 时，即为原始的概率分布；
+当 T<1 时，得到的概率分布将更加尖锐，弥散程度更小，采样的随机性降低；
+当 T-> 0时，使用随机采样解码的效果近似于贪心搜素；
+当 T > 1 时，得到的概率分布弥散程度更小，采样的随机性升高；
+当 T -> 无穷大 时，使用随机采样解码的效果则近似于从均匀分布中随机采样。
+因此，合理设置 T 在0到1之间 可以避免随机采到概率较小的词。
+
+4.1.3 Top-k 采样
+除了设置温度来调整概率分布的弥散程度，Top-k 采样近来也被广泛使用。
+具体来说，在每个 step，解码器首先选择概率最高的 k 个 word 作为候选 word 构成一个集合，
+然后将这个子集中 word 的概率再归一化，最后从新的概率分布中采样。
+这个办法据说可以获得比 Beam Search 好很多的效果，但也有一个问题，就是这个 k 值不太好选。
+因为实际应用中概率分布变化比较大，有时候可能很均匀，有的时候比较集中。
+对于集中的情况还好说，当分布均匀时，一个较小的 k 容易丢掉很多优质候选词。
+但如果 k 定的太大，这个方法又会退化回普通采样。
+
+4.1.4 Top-p 采样
+相比于 Top-k 方法从概率最高的 k 个候选词中采样，它不再取一个固定的 k，而是固定候选集合的概率密度和在整个概率分布中的比例。
+也就是构造一个最小候选集，使得
+2104.png
+Top-p 采样根据生成概率从高到低在词表上选择累积概率恰好超过 p 的候选 word 作为采样集合，
+再从这些候选 word 中采样出最终的结果。
+选出来这个集合之后也和 Top-k 采样一样，重新归一化集合内 word 的概率，并把集合外词的概率设为 0。
+
+4.2 调用链
+sampling decoding 模块的核心逻辑封装在 decoding_sampling.h 文件的 DecodingSampling 类中，
+计算逻辑都在 forward 函数里，具体调用链如下：
+        DecodingSampling->DecodingSampling()  // 构造函数
+        DecodingSampling->forward()
+            ->init_kernelLauncher
+            ->loop for step
+                ->embedding_lookup_sine_position_encoding_kernel_launcher
+                ->loop for decoder layer
+                    ->decoder->initialize
+                    ->decoder->forward
+                ->decoder->decoder_norm1
+                ->cublasGemmEx
+                ->sampling_kernel_kernelLauncher
+
+4.3 DecodingSampling 构造函数
+构造函数内部首先进行了 candidate_num_ 和 probability_threshold_ 的判断，不能同时为 0 或同时不为 0，
+这两个参数分别代表 Top-k 采样的 k 和 Top-p 采样的 p，
+意思是源码提供了两种采样解码策略，在初始化的时候必须确定使用哪一种。
+
+接下来就是一些内存分配的工作，和 v2.0 版本基本一致，笔者根据源码绘制了一份内存分布图如下。
+            2103.png
+首先在构造函数内部初始化了 2 个二级指针 K_cache_ 和 V_cache，
+这个指针是用来存储解码过程中每个 step 对应的输入 tensor 经过 Dense 变换后的 key 矩阵和 value 矩阵，用于 self-attention 的。
+可以看到这两个指针申请的内存大小和之前 v2.0 版本 DecodingOpenNMT 类中有所不同，
+DecodingOpenNMT 中有两个元素，DecodingSampling 中只有一个，
+这是因为 DecodingOpenNMT 的解码策略只有一个 beam search，beam search 每轮结束后取 TopK 的时候会打乱顺序，
+需要一个元素暂存当前每个 beam 的 Key 和 Value，
+等 TopK 确定后再根据 parent_ids 更新 Key 和 Value。
+而使用采样解码策略就不存在这个问题，所以一个元素足矣。
+    K_cache_ = new DataType_ *[1];
+    V_cache_ = new DataType_ *[1];
+然后就是一系列 buffer size 的计算，用于内存申请和分配的，结合笔者整理的内存分布图可以非常容易的理解。
+
+6 小结
+总的来说，v2.1 版本的 Faster Transformer 相比与 v2.0 版本细节改动还是比较多的，
+但是整体大框架没有改变，仍然还是 3 个主要模块：Encoder、Decoder、Decoding，
+
+新增了 Effective Transoformer 和 sample Decoding 两个子模块。
+
+现对本文总结如下：
+
+        新增了 Effective Transoformer，通过动态删除和恢复填充值的方式一定程度上可以节约 Encoder 部分的计算资源，
+        当一个 batch 内样本长度变化越大，性能提升越明显。
+        在实际应用中，训练模型阶段，其实在处理数据时一般会刻意地将一个 batch 的文本长度控制在一个较小的变化范围，
+        但在推理阶段通常不会这么干，所以这个 Effective Transoformer 就有用武之地了。
+
+        在 Top-k 采样中，源码给出了一个很好的求 topK 的思路，值得学习借鉴。
+
+        在 Top-p 采样中，源码示范了如何调用 cub 库 API 进行分组排序，值得学习借鉴。
+
+        在计算 self-attention 过程中，
+        源码示范了 cuBLAS 库的 cublasGemmBatchedEx 函数调用方法，将三次串行调用矩阵乘法 API 缩减为 1 次。
+
+        在 Decoder 中，源码首次引入向量化数据类型，提升访存效率。
+
+本文使用 Zhihu On VSCode 创作并发布
+
+发布于 2023-09-05 10:39・IP 属地上海

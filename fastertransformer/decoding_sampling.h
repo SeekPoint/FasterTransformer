@@ -247,7 +247,8 @@ public:
       }
     }
   }
-
+//    4.4 forward 函数
+//    这个函数的计算逻辑过于复杂，不适合单列一节，大致过程见调用链，当笔者把 forward 内部调用链中子模块讲清楚的时候，forward 也就清晰了
   void forward(const DecoderInitParam<DataType_> *param,
                DecodingInitParam<DataType_> decoding_params)
   {
@@ -265,7 +266,8 @@ public:
       word_ids: start_id_
       cum_log_buf_: useless, keep it to reuse the kernel of decoding_opennmt.h
     */
-
+//        4.5 init_kernelLauncher
+//        关于初始化函数，源码针对 Top-k 和 Top-p 两种不同的解码策略分别给了一个核函数，我们分别来研究一下
     if(args_.candidate_num_ != 0)
     {
       init_kernelLauncher(finished_buf_, decoding_params.sequence_length, word_ids_buf_, cum_log_buf_,
