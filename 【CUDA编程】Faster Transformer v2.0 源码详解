@@ -1,3 +1,6 @@
+【CUDA编程】Faster Transformer v2.0 源码详解
+https://zhuanlan.zhihu.com/p/650462095
+
 写在前面：笔者之前对 Nvidia BERT 推理解决方案 Faster Transformer v1.0 版本源码进行了深度剖析，
 详细介绍了源码中的各种优化技巧，文章受到不少读者的肯定。
 应读者之邀，本文将对 Faster Transformer v2.0 版本源码进行解读，
@@ -112,7 +115,7 @@ Decoding 模块的核心逻辑封装在 decoding_opennmt.h 文件的 DecodingOpe
 
         申请 K_mem_cache_ 和 V_mem_cache_ 内存的时候有个小 bug，
         官方已在 v2.1 版本修复。
-        
+
 本文使用 Zhihu On VSCode 创作并发布
 
 发布于 2023-08-16 19:04・IP 属地上海
