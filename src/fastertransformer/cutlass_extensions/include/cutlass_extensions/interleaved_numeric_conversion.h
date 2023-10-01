@@ -174,20 +174,25 @@ struct FastInterleavedAndBiasedNumericArrayConverter<bfloat16_t, uint8_t, 4> {
         uint32_t*      bf16_result_ptr = reinterpret_cast<uint32_t*>(&result);
         uint32_t const i8s             = reinterpret_cast<uint32_t const&>(source);
 
+        // 0x4B000000 -> 0b 0 10010110 0000...0000
+        // 10010110   -> 150 -> 150 - 127 = 23 -> 2^23 = 8388608
+        // + 128      -> 8388608 + 128 = 8388736
         static constexpr uint32_t fp32_base = 0x4B000000;
         float                     fp32_intermediates[4];
 
         // Construct FP32s, bfloat does not have enough mantissa for IADD trick
+        // {b, a} = {{0x4B, 0x00, 0x00, 0x00},{e3, e1, e2, e0}}
         uint32_t* fp32_intermediates_casted = reinterpret_cast<uint32_t*>(fp32_intermediates);
-        fp32_intermediates_casted[0]        = __byte_perm(i8s, fp32_base, 0x7650);
-        fp32_intermediates_casted[1]        = __byte_perm(i8s, fp32_base, 0x7652);
-        fp32_intermediates_casted[2]        = __byte_perm(i8s, fp32_base, 0x7651);
-        fp32_intermediates_casted[3]        = __byte_perm(i8s, fp32_base, 0x7653);
+        fp32_intermediates_casted[0]        = __byte_perm(i8s, fp32_base, 0x7650);  // 0x{4B0000}{e0}
+        fp32_intermediates_casted[1]        = __byte_perm(i8s, fp32_base, 0x7652);  // 0x{4B0000}{e1}
+        fp32_intermediates_casted[2]        = __byte_perm(i8s, fp32_base, 0x7651);  // 0x{4B0000}{e2}
+        fp32_intermediates_casted[3]        = __byte_perm(i8s, fp32_base, 0x7653);  // 0x{4B0000}{e3}
 
         // Subtract out fp32_base + 128 to make the unsigned integer signed.
         CUTLASS_PRAGMA_UNROLL
         for (int ii = 0; ii < 4; ++ii) {
             fp32_intermediates[ii] -= 8388736.f;
+            // f32 arr {e3, e2, e1, e0}
         }
 
         // Truncate the fp32 representation and pack up as bfloat16s.
@@ -195,6 +200,7 @@ struct FastInterleavedAndBiasedNumericArrayConverter<bfloat16_t, uint8_t, 4> {
         for (int ii = 0; ii < 2; ++ii) {
             bf16_result_ptr[ii] =
                 __byte_perm(fp32_intermediates_casted[2 * ii + 0], fp32_intermediates_casted[2 * ii + 1], 0x7632);
+                 // keep high 16 bits as BF16
         }
 #else
         // Disable this on architectures older than Ampere since they lack hardware for bf16 mma. If one wishes to use
