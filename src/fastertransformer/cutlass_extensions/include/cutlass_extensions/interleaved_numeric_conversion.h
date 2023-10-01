@@ -46,6 +46,13 @@ namespace cutlass {
 // bits and the odd elemeents are in the high bits of the register. In addition, it assumes elements were originally
 // signed and had a bias of 2**(b-1) added (where b is the number of bits in the type) to make all numbers unsigned.
 // This converter will uninterleave the data and subtract the bias while converting to the result type.
+// --------------------------- Notes from NVIDIA FasterTransformer ------------------------------
+// -------------------------------------- Notes from Personal -----------------------------------
+// 个人理解：
+// 假设保存好的uint8量化权重，在内存中，是交织(interleaved)后的布局，偶数索引的元素保存在低bits，奇数索引的元素
+// 保存在高bits，也就是原始在内存中的布局（右侧为低字节）{e3,e2,e1,e0} 交织为 {e3,e1,e2,e0}. 这应该是为了更好
+// 地利用硬件的特性获得更好的性能。另外，也假设保存好uint8权重是已经 + 2**(b-1)的了，即128，已经是unsigned数值。
+// 因此，反量化函数，需要完成几个事，即：反量化、解交织 和 减128恢复原值大小。
 template<typename T, typename S, int N>
 struct FastInterleavedAndBiasedNumericArrayConverter {
 };
@@ -58,22 +65,53 @@ struct FastInterleavedAndBiasedNumericArrayConverter<half_t, uint8_t, 4> {
     CUTLASS_DEVICE
     static result_type convert(source_type const& source)
     {
-        result_type result;
-
+        result_type result; // Array<half_t, 4>  32x2 bits
+        // 注意，这里的h实际上指向了一块大小为32x2bits的连续内存，只是为了方便后续的
+        // 操作，reinterpret为uint32_t，即h[0]代表低32bits，h[1]代表高32bits
         uint32_t*      h   = reinterpret_cast<uint32_t*>(&result);
         uint32_t const i8s = reinterpret_cast<uint32_t const&>(source);
-
+        // 字节选择器，虽然是uint32_t，但实际只有低16bits有值
+        // byte selector: [0][101] [0][010] [0][101] [0][000]
         static constexpr uint32_t mask_for_elt_01     = 0x5250;
+        // byte selector: [0][101] [0][011] [0][101] [0][001]
         static constexpr uint32_t mask_for_elt_23     = 0x5351;
+        // pack {b, a}成{{b7, b6, b5, b4},{b3, b2, b1, b0}}
+        // {b, a} = {{0x64, 0x64, 0x64, 0x64}, {b3, b2, b1, b0}}
+        // 由于原始在内存中的布局（右侧为低字节）{e3,e2,e1,e0} 已经交织为
+        // {e3,e1,e2,e0}所以{b, a}在内存中实际的值排布为：
+        // {b, a} = {start_byte_for_fp16, i8s} =
+        // {{0x64, 0x64, 0x64, 0x64}, {e3, e1, e2, e0}}
         static constexpr uint32_t start_byte_for_fp16 = 0x64646464;
+        // mask_for_elt_01就是选择器，根据选择器和{b,a}，我们可以的到h[0]的值
+        // mask_for_elt_01 -> [0][101] [0][010] [0][101] [0][000]
+        // mask_for_elt_01 ->   d.b3     d.b2     d.b1     d.b0
+        // mask_for_elt_01 ->   5        2        5        0
+        // mask_for_elt_01 ->   0x64     e1       0x64     e0
+        //            h[0] ->   0x64[e1]64[e0]
         asm volatile("prmt.b32 %0,%1,%2,%3;\n" : "=r"(h[0]) : "r"(i8s), "n"(start_byte_for_fp16), "n"(mask_for_elt_01));
+        // mask_for_elt_23就是选择器，根据选择器和{b,a}，我们可以的到h[1]的值
+        // mask_for_elt_23 -> [0][101] [0][011] [0][101] [0][001]
+        // mask_for_elt_23 ->   d.b3     d.b2     d.b1     d.b0
+        // mask_for_elt_23 ->   5        3        5        1
+        // mask_for_elt_23 ->   0x64     e3       0x64     e2
+        //            h[1] ->   0x64[e3]64[e2]
         asm volatile("prmt.b32 %0,%1,%2,%3;\n" : "=r"(h[1]) : "r"(i8s), "n"(start_byte_for_fp16), "n"(mask_for_elt_23));
+        // 需要注意的是h[1]h[0]保存的值，已经是解交织后的排布了，即 {e3,e2,e1,e0}
+        // NOTE: ei = ei_ori + 128
 
         // Lastly, we subtract 1152 from our constructed number using fp16 math to get our signed integer as fp16.
         static constexpr uint32_t I8s_TO_F16s_MAGIC_NUM = 0x64806480;
+        // h[0] ->   0x[64[e1]][64[e0]]   -   0x[6480][6480]
+        // h[0] ->   0x([64[e1]] - [6480]) ([64[e0]] - [6480])
+        // h[0] ->   0x[e1_ori][e0_ori]
         asm volatile("sub.f16x2 %0, %1, %2;\n" : "=r"(h[0]) : "r"(h[0]), "r"(I8s_TO_F16s_MAGIC_NUM));
+        // h[1] ->   0x[64[e3]][64[e2]]   -   0x[6480][6480]
+        // h[1] ->   0x([64[e3]] - [6480]) ([64[e2]] - [6480])
+        // h[1] ->   0x[e3_ori][e2_ori]
         asm volatile("sub.f16x2 %0, %1, %2;\n" : "=r"(h[1]) : "r"(h[1]), "r"(I8s_TO_F16s_MAGIC_NUM));
-
+        // 最终，获得量化权重的FP16表示，并且完成解交织
+        // h[1]h[0](右侧为低字节)解交织为 FP16 arr {e3_ori_f16, e2_ori_f16, e1_ori_f16, e0_ori_f16}
+        // arr[0] = e0_ori_f16, arr[1] = e1_ori_f16, arr[2] = e2_ori_f16, arr[3] = e3_ori_f16
         return result;
     }
 

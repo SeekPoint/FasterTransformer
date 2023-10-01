@@ -1,0 +1,170 @@
+[大模型推理]🔥WINT8/4分析（1）：PRMT指令详解及FasterTransformer源码解析
+DefTruth
+
+目录
+收起
+0x00 前言
+0x01 反量化流程分析
+0x02 PRMT指令详解
+0x03 反量化函数解析
+0x04 整体处理
+0x05 调用链路
+0x06 总结
+
+0x00 前言
+关键词：快速反量化、PRMT.B32指令、SUB.F16X2指令、解交织
+
+上一篇文章分析了NVIDIA在MoE大模型推理中用到的快速反量化技术，
+论文指出，他们在实验中发现，使用原生的native Int8ToFloat16做数值类型转换，性能并不符合预期。
+于是，大佬们决定，将
+native Int8ToFloat16（吞吐低，底层应该是走 PTX cvt指令->SASS，之后再抽空profile一下）替换成一系列高吞吐的ALU和FP16运算指令，
+来巧妙地完成Int8->Float16的数值转换。关于快速反量化原理的理解，推荐大家看（强烈建议）：
+
+[大模型推理]🔥WINT8/4分析（0）: 通俗易懂讲解-快速反量化算法
+
+但是，上篇文章只讲了原理，没讲具体实现，在这篇文章，我们就来详细讲讲它的实现。
+
+0x01 反量化流程分析
+
+为了最好地利用硬件，在具体实现中，一次性转换两个 int8值到 FP16，这是由于2 个 FP16 元素可以放入一个 32 位寄存器中。对于Int8的量化权重，具体反量化步骤为：
+
+    # 反量化步骤
+    步骤一：我们加载4个 int8 值，[e0, e1, e2, e3] W+ 写入单个 32 位寄存器。
+
+    步骤二：然后我们创建第二个 32 位寄存器 R1，存储 [e0 + 1024，e1 + 1024]的 FP16 表示，这里利用的是“观察二”，原理见上一篇文章。
+
+    步骤三：接下来，我们使用浮点数学进行减法[1152, 1152] 来自 R1。
+    这个减法是由于事实上我们必须减去 1024 以便将 R1 中的每个数字将 e0 和 e1 转换为 FP16。
+
+    然后，我们必须进一步从每个中减去 128 获取浮点表示的数字原始的有符号整数。
+
+    步骤四：最后，我们对 e2 和 e3 重复步骤 2 和 3，
+    也就是将单个32 位寄存器中的 [e0, e1, e2, e3] 全部转换为FP16，但是4个FP16需要两个32寄存器来保存。
+
+FasterTransformer中的代码中实现如下，代码在：interleaved_numeric_conversion.h 中。
+15.webp
+
+核心的逻辑包括在将量化int类型的FP16表达的具体实现为（Y_FP16=Y'-1024-128）：
+
+    // Lastly, we subtract 1152 from our constructed number using fp16 math to get our signed integer as fp16.
+    static constexpr uint32_t I8s_TO_F16s_MAGIC_NUM = 0x64806480;
+    asm volatile("sub.f16x2 %0, %1, %2;\n" : "=r"(h[0]) : "r"(h[0]), "r"(I8s_TO_F16s_MAGIC_NUM));
+    asm volatile("sub.f16x2 %0, %1, %2;\n" : "=r"(h[1]) : "r"(h[1]), "r"(I8s_TO_F16s_MAGIC_NUM));
+
+以及如何实现0x6400 | Y。
+可以看到，代码中使用了PRMT指令，
+这个指令的含义是permute，把两个输入操作数pack成一组8个字节，并按照指定的mode打乱，获得新的32bit（4个字节），保存在目标寄存器上。
+
+    static constexpr uint32_t mask_for_elt_01     = 0x5250;
+    static constexpr uint32_t mask_for_elt_23     = 0x5351;
+    static constexpr uint32_t start_byte_for_fp16 = 0x64646464;
+    asm volatile("prmt.b32 %0,%1,%2,%3;\n" : "=r"(h[0]) : "r"(i8s), "n"(start_byte_for_fp16), "n"(mask_for_elt_01));
+    asm volatile("prmt.b32 %0,%1,%2,%3;\n" : "=r"(h[1]) : "r"(i8s), "n"(start_byte_for_fp16), "n"(mask_for_elt_23));
+
+SUB.F16x2指令很好理解，即同时执行2组fp16x2之间的减法。
+PRMT的用法刚开始看可能会有点懵，但这是实现0x6400 | Y 的核心逻辑，因此，接下来，本文将会讲解PRMT指令的详细用法。
+
+0x02 PRMT指令详解
+
+参考NV PTX ISA 8.1 文档，章节9.7.8.7 Data Movement and Conversion Instructions: prmt的内容。
+
+    prmt：permute bytes from register pair
+    prmt.b32{.mode} d, a, b, c;
+    .mode = { .f4e, .b4e, .rc8, .ecl, .ecr, .rc16 }
+
+PRMT指令，会从两个 32 位寄存器a, b,中选取四个任意字节，重新组成32位值，并保存在目标寄存器中。
+在通用形式（未指定模式）中，最终选取的4个字节，由四个 4 bit的选择器组成。PRMT指令会将两个源寄存器a,b中的字节编号为0到7，具体形式为：
+
+    {b,a} = {{b7,b6,b5,b4}，{b3，b2，b1，b0}}
+
+对于目标寄存器中的每个字节，定义了一个 4 位选择器。选择值的 3 个 低位lsb 指定应将 8 个源字节中的哪一个移至目标中位置。
+msb 定义是否应直接复制原始字节值，或者是否应复制符号（即，是否进行符号扩展）；msb=0表示直接复制原始的bit值，msb=1，则表示进行符号扩展。
+为简单起见，这里只关注PRMT指令的通用形式。（事实上，这个指令还有f2e、b4e、rc8等特殊模型）
+16.webp
+对于这条指令：
+
+    prmt.b32{.mode} d, a, b, c;
+
+d是目标操作数，a,b分别是两个32bit的源操作数，c是选择器。需要注意的是，c中只有低16位是有用的（即使输入的是32bit寄存器），
+因为，d.b_i 中只有四个待确定的字节，每个字节需要 4 bit作为选择器，
+从 {b,a} = {{b7,b6,b5,b4}，{b3，b2，b1，b0}} 中选择对应的字节作为自己的值。
+之所以4bit，是因为3bit就可以索引0~7，覆盖了8个字节，还需要1bit表示是否进行符号扩展。
+举个例子：
+
+    c[3:0] -> 0001 -> msb 0 lsb 001 -> 不进行符号扩展，并选择 index 1的字节，即 b1 -> d.b0 = b1
+
+0x03 反量化函数解析
+
+在了解了PRMT指令的用法后，我们可以继续来看Fast Int8ToFloat16的具体实现了。
+源码在NV FasterTransformer中的FastInterleavedAndBiasedNumericArrayConverter结构体，
+该struct的功能为：对交织保存的权重，反量化并同时解交织。
+核心实现在convert函数上，这里提供这个函数的一个增加了个人详细注释的版本。
+
+。。。。yknote代码中
+
+可以看到了，在代码实现中，PRMT其实完成了两个功能，即 0x6400 | Y 的构造，以及解交织；
+而SUB.F16x2，则负责减去1152（1024+128），从而获得量化权重的FP16表达，并且SUB.F16x2处理2个值，也尽可能提高了吞吐。
+
+0x04 整体处理
+上边讲的是4个uint8的反量化操作，我们最后再简单看下整体上是怎么处理所有uint8量化权重的反量化的。
+
+template<int N>
+struct FastInterleavedAndBiasedNumericArrayConverter<half_t, uint8_t, N> {
+    static constexpr int VEC_WIDTH = 4;
+.....
+
+首先，定义了device函数convert，模板FastInterleavedAndBiasedNumericArrayConverter类中，模板参数N表示uint8元素的个数。
+该函数首先是检查N是否是4的倍数，VEC_WIDTH=4，也就是支持N为4的倍数的情况。
+这是由于，只实现一次性处理4个元素的特例化的Converter，即：
+
+    FastInterleavedAndBiasedNumericArrayConverter<half_t, uint8_t, 4>;
+
+然后，在convert函数内部，实例化了这个特例化的Converter为：convert_vector_；
+最后，通过for循环来每4个uint8元素一组进行处理，并且使用了CUTLASS_PRAGMA_UNROLL进行了循环展开。
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < N / VEC_WIDTH; ++i) {
+       result_ptr[i] = convert_vector_(source_ptr[i]);
+    }
+
+至此，所有的uint8权重就被处理完了。
+
+0x05 调用链路
+最后，我们再看下这个反量化函数的调用链路。
+首先是在default_dq_mma.h中定义SetConverters模板类（分别支持Volta和Turing+架构），
+接着在default_dq_mma_pipelined.h中使用SetConverters设置转换器，
+并在cutlass::gemm::threadblock::DqMmaPipelined中作为模板参数传入；
+然后，在dq_mma_pipelined.h中，我们可以看到DqMmaPipelined模板类的实现，
+它最后使用了：
+
+    TransformBAfterLDG ldg_converter;
+    TransformBAfterLDS lds_converter;
+
+并且在循环中使用了ldg_converter或lds_converter对量化权重进行转换，
+这个转换过程是以warp为单位进行的，并且，在SetConverters模板类的实现中，
+我们看到TransformBAfterLDG或TransformBAfterLDS中的N（需要转换的元素葛素）是通过 MmaOperator::FragmentB::kElements来指定的，
+FragmentB::kElements表示MMA操作中矩阵B在warp中一个fragment所持有的元素个数。
+这个调用流程也是值得仔细梳理一番的，现在先整理个大致的流程，
+
+后续再开一篇文章来分析吧（emmm....给自己挖了好多坑了.....）
+17.webp
+
+0x06 总结
+本文整理了快速反量化算法的步骤、详细讲解了PRMT指令的用法，并对FasterTransformer中的源码作用及内联汇编的作用进行了详细的讲解。
+相信看到这里，大家应该清楚快速反量化算法的实际实现了。
+但是这里只讲到了int8权重的反量化，int4权重反量化以及详细的调用流程还没提到，这将会再额外开几篇文章分析。
+
+附大模型WINT8/4分析系列：
+
+[大模型推理]🔥WINT8/4分析（0）: 通俗易懂讲解-快速反量化算法
+6 赞同 · 0 评论文章
+
+[大模型推理][20篇]🔥LLM推理论文集v0.2-300页PDF💡
+62 赞同 · 8 评论文章
+
+DefTruth：[大模型推理] WINT8/4分析（2）：快速反量化之INT8->BF16
+8 赞同 · 0 评论文章
+
+持续更新，错字先更后改......
+
+最后，祝大家中秋快乐~
