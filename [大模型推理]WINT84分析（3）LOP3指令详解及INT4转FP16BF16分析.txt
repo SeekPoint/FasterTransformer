@@ -1,0 +1,196 @@
+[大模型推理]🔥WINT8/4分析（3）：LOP3指令详解及INT4转FP16/BF16分析
+
+https://zhuanlan.zhihu.com/p/657073857
+
+0x00 前言
+关键词：INT4、FP16、BF16、LOP3.B32、FMA.RN.F16X2、SUB.F16X2
+
+前3篇文章分析了NVIDIA在MoE大模型推理中用到的快速反量化技术的原理，以及INT8快速反量化到FP16和BF16的具体实现。
+FP16和BF16都是大模型推理中常用的数据类型。这篇继续讲一下INT4快速反量化到F16/BF16具体是怎么处理的。
+论文中对于INT4的处理基本是一笔带过，细节都在代码里。
+另外，【强烈建议】先阅读完前3篇，再来阅读本篇内容。
+
+DefTruth：[大模型推理] WINT8/4分析（0）: 通俗易懂讲解-快速反量化算法
+DefTruth：[大模型推理] WINT8/4分析（1）：PRMT指令详解及FasterTransformer源码解析
+DefTruth：[大模型推理] WINT8/4分析（2）：快速反量化之INT8转BF16
+
+0x01 INT4反量化流程
+
+权重交织和1032
+基本流程和INT8差不多，但代码实现差别很大。论文中提到INT4的权重，是交织保存的，将偶数索引和奇数索引的各自放在一起。
+这个权重交织的操作，其实在先前的文章中讲到的INT8反量化中就有提到，不过在论文中也没有说明。
+另一点就是，INT4反量化使用的Magic Number为1032（1024+8）.
+19.webp
+
+INT4反量化的特点
+在DefTruth：[大模型推理] WINT8/4分析（1）：PRMT指令详解及FasterTransformer源码解析
+中有讲到，INT8快速反量化中，使用了PRMT指令，这个指令的操作粒度是字节byte；
+而INT4是sub-byte，不足一个字节；因此，原来在INT8快速反量化的那一套无法直接用在INT4上。
+那么INT4要怎么处理呢？NV FasterTransformer的实现中，使用了另一个指令LOP3来替代PRMT，从而完成了INT4快速反量化到FP16/BF16的核心逻辑。
+接下来，我们就先看看这个LOP3 PTX汇编指令。
+
+提示：由于涉及到的很多知识点都在前置的3篇文章，本篇中不再重复，所以建议大家看完前3篇，再来看INT4。
+
+0x02 LOP3指令详解
+
+INT4反量化中使用到了LOP3、FMA 和 SUB 指令。其中 LOP3 指令是重点，所以我们先来讲讲LOP3指令。
+本节内容，参考NV PTX ISA 8.1文档9.7.7.6 Logic and Shift Instructions: lop3小节。
+
+lop3: Arbitrary logical operation on 3 inputs.
+
+    lop3.b32 d, a, b, c, immLut;
+
+LOP3指令对3个输入a,b,c（都是32位寄存器）执行任意的逻辑操作，比如 (a & b) | c；
+并把逻辑运算后的结果保存在目的寄存器d中（也是一个32位寄存器）；操作数immLut，指定了对a,b,c需要执行的操作。
+按照NV PTX ISA 8.1文档中的说明，immLut和一个look-up table进行对应，immLut的可选值范围为0~255，
+每一个值，映射到一个特定的F(a,b,c)，比如immLut为0x80时，LOP3对a,b,c执行：d=(a & b & c)。
+20.webp
+
+那么，对于某个操作，比如F(a,b,c)=(a & b & c)，我们到底要怎么样指定这个immLut值呢？
+对于逻辑运算 F(a, b, c)，可以通过应用相同的方法来计算 immLut 的值，对三个预定义常数值（ta,tb,tc）的运算如下：
+
+    # ta,tb,tc都是预定义的值，每个都是8bits
+    ta = 0xF0;
+    tb = 0xCC;
+    tc = 0xAA;
+    immLut = F(ta, tb, tc);
+
+举一些例子：
+
+    If F = (a & b & c);
+    immLut = 0xF0 & 0xCC & 0xAA = 0x80
+    If F = (a | b | c);
+    immLut = 0xF0 | 0xCC | 0xAA = 0xFE
+    If F = (a & b & ~c);
+    immLut = 0xF0 & 0xCC & (~0xAA) = 0x40
+    If F = ((a & b | c) ^ a);
+    immLut = (0xF0 & 0xCC | 0xAA) ^ 0xF0 = 0x1A
+
+比如，当你想要LOP3执行(a & b & c)操作时，这时immLut的值为0xF0 & 0xCC & 0xAA = 0x80，
+也就是，对ta,tb,tc执行和a,b,c一样的逻辑操作后得到的值，即为immLut；然后：
+
+    lop3.b32 d, a, b, c, 0x80; // 得到的d=(a & b & c)
+
+OK，LOP3指令的解释，差不多就这样，还是很好理解的。至于FMA、SUB这些都是常见的指令，相信大家也比较熟悉了，这里也不展开讲解了。
+
+0x03 INT4转FP16
+
+关于交织的量化权重在内存中的布局、解交织等知识，在本文不再重复，请读者自行阅读：
+DefTruth：[大模型推理] WINT8/4分析（1）：PRMT指令详解及FasterTransformer源码解析；
+源码在NV FasterTransformer中的FastInterleavedAndBiasedNumericArrayConverter结构体。
+
+    template<>
+    struct FastInterleavedAndBiasedNumericArrayConverter<half_t, uint4b_t, 8> {
+        using result_type = Array<half_t, 8>;
+        using source_type = Array<uint4b_t, 8>;
+
+核心实现在convert函数上，该函数实现了INT4到FP16的反量化函数，也需要负责处理几个事情，
+即：对交织保存的权重，反量化并同时解交织。我们直接来看源码吧，这里提供这个函数的一个增加了个人详细注释的版本。
+
+。。。。。
+
+首先，看i4s = {e7,e5,e3,e1,e6,e4,e2,e0}，
+这是由于加载的是交织后的权重，偶数索引的元素被保存在低字节，奇数索引的元素被保存在高字节；
+并且，Array<uint4b_t, 8>&类型的source可以使用reinterpret_cast，这和cutlass Array数据结构的实现相关，
+Array<uint4b_t, 8>实际上只有一个private成员变量Storage storage[kStorageElements]，代表一块连续的内存。
+其他都是static const成员，并且在编译期实现求值；因此source引用或指针，指向的实际就是storage；
+对于Array<uint4b_t, 8>来说，storage是uint32_t；Array<uint4b_t, 8>的相关实现，
+可以在cutlass的array_subbyte中找到，其中关于storage类型的指定是：
+
+      /// Storage type
+      using Storage = typename platform::conditional<
+        ((kSizeBits % 32) != 0),
+        typename platform::conditional<
+          ((kSizeBits % 16) != 0),
+          uint8_t,
+          uint16_t
+        >::type,
+        uint32_t
+      >::type;
+    // ....
+    private:
+      /// Internal storage
+      Storage storage[kStorageElements];
+
+然后，先指定一组预定义变量，包括immLut，BOTTOM_MASK/TOP_MASK和I4s_TO_F16s_MAGIC_NUM，
+其中BOTTOM_MASK/TOP_MASK对应为LOP3指令中的b，I4s_TO_F16s_MAGIC_NUM对应LOP3指令中的c，
+immLut指定了对LOP3中的a,b,c执行(a&b)|c逻辑操作。
+
+    static constexpr uint32_t immLut                = (0xf0 & 0xcc) | 0xaa;  // 0b11101010
+    static constexpr uint32_t BOTTOM_MASK           = 0x000f000f;  // 0xf -> 0b1111 select index 0,4
+    static constexpr uint32_t TOP_MASK              = 0x00f000f0;  // select index 1,5
+    static constexpr uint32_t I4s_TO_F16s_MAGIC_NUM = 0x64006400;  // 1024
+
+接下来，先将i4s右移8位，获得top_i4s，这样就可以复用BOTTOM_MASK和TOP_MASK，获取e7,e6,e3,e2；
+
+    {e7,e5,e3,e1,e6,e4,e2,e0} -> shift right 8 bits -> {0x0,0x0,e7,e5,e3,e1,e6,e4}
+
+然后，就是利用LOP3指令，实现 0x6400 | Y构造和解交织操作。
+需要注意的是，对于elt_23，LOP3指令执行后，这时e3和e2是被保存在各自两个低字节的【高4bits】；
+这也是后续为什么要使用fma指令来还原原值的原因！因为，保存在高4bits，事实就是y*16（2^4=16）；
+
+    // Extract elt_01 - (i4s & 0x000f000f) | 0x64006400
+    asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
+        : "=r"(h[0])
+        : "r"(i4s), "n"(BOTTOM_MASK), "n"(I4s_TO_F16s_MAGIC_NUM), "n"(immLut));
+    // Extract elt_23 (i4s & 0x00f000f0) | 0x64006400
+    // NOTE: 0x64[e3]064[e2]0 需要注意的是这时e3和e2是被保存在各自两个低字节的【高4bits】的
+    // 这也是后续为什么要使用fma指令来还原原值的原因！注意，保存在高4bits，事实就是y*16（2^4=16）
+    asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
+                  : "=r"(h[1])
+                  : "r"(i4s), "n"(TOP_MASK), "n"(I4s_TO_F16s_MAGIC_NUM), "n"(immLut));
+
+最后，分别对elt_01、elt_45使用SUB.F16X2，减去魔数，还原原值，这个很好理解。
+
+    // Convert elt_01
+    asm volatile("sub.f16x2 %0, %1, %2;\n" : "=r"(h[0]) : "r"(h[0]), "r"(FP16_TOP_MAGIC_NUM));
+    // Convert elt_45
+    asm volatile("sub.f16x2 %0, %1, %2;\n" : "=r"(h[2]) : "r"(h[2]), "r"(FP16_TOP_MAGIC_NUM));
+
+而，对对elt_23、elt_67则使用FMA.RN.F16X2指令还原原值。
+
+    // Convert elt_23
+    asm volatile("fma.rn.f16x2 %0, %1, %2, %3;\n" : "=r"(h[1]) : "r"(h[1]), "r"(ONE_SIXTEENTH), "r"(NEG_72));
+    // Convert elt_67
+    asm volatile("fma.rn.f16x2 %0, %1, %2, %3;\n" : "=r"(h[3]) : "r"(h[3]), "r"(ONE_SIXTEENTH), "r"(NEG_72));
+
+这是e3、e2、e7和e6是被保存在各自字节中的【高4bits】的，一般情况下，4-subbyte应该是保存在8bits的低4bits的。
+而现在保存在高4bits。
+源码中采取的做法是，使用FMA指令执行一个等价的数学运算还原原值，而不是先把e3、e2、e7和e6移动到各自字节的低4bits。
+个人理解如下：
+
+    // This is the half2 {1 / 16, 1 / 16} represented as an integer.
+    static constexpr uint32_t ONE_SIXTEENTH = 0x2c002c00;
+    // This is the half2 {-72, -72} represented as an integer.
+    // 个人理解: -72 = -64 - 8, massita expr 1024/16 + ((x+8)*16)/16 - 64 - 8 = x
+    // Y_FP16 = 1024 + (x+8)*16, x = Y_FP16/16 - 64 - 8
+    // (1024 + (x+8)*16)/16 = 64 + x + 8
+    static constexpr uint32_t NEG_72 = 0xd480d480;
+因此，对当前的Y_FP16执行Y_FP16/16 - 64 - 8，得到就是FP16表达的Y原值，这刚好是一个FMA操作。
+
+0x04 INT4转BF16
+实现逻辑和INT4转FP16类似，也是依赖LOP3指令和FMA指令。需要注意的是，Magic Number和BF16尾数为7位（不足8位）带来的区别。
+对于BF16，由于尾数为7位，因此Magic Number选择为2^7=128；
+同时，也由于尾数为7位，在INT4转BF16时，无法像转FP16那样，可以先右移8位。
+其他细节不再啰嗦了，直接给大家放一个带个人注释的版本吧。
+
+template<>
+struct FastInterleavedAndBiasedNumericArrayConverter<bfloat16_t, uint4b_t, 8> {
+ 。。。。
+
+0x05 调用链路
+详见 DefTruth：[大模型推理] WINT8/4分析（1）：PRMT指令详解及FasterTransformer源码解析 中的分析。
+
+0x06 总结
+本文整理了快速反量化算法在INT4上的应用、LOP3汇编指令的详细用法，
+并对FasterTransformer中的INT4转FP16/BF16的源码作用及内联汇编的作用进行了详细的讲解。
+写到这里，大模型WINT8/4分析系列就差不多写完了，总共有4篇。
+
+附大模型WINT8/4分析系列前3篇：
+DefTruth：[大模型推理] WINT8/4分析（0）: 通俗易懂讲解-快速反量化算法
+DefTruth：[大模型推理] WINT8/4分析（1）：PRMT指令详解及FasterTransformer源码解析
+DefTruth：[大模型推理] WINT8/4分析（2）：快速反量化之INT8转BF16
+
+持续更新，错字先更后改......
+
+编辑于 2023-10-01 16:31・IP 属地广东
