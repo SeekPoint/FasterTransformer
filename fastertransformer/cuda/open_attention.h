@@ -162,47 +162,81 @@ forward 方法中首先就是对输入的 3 个 tensor 进行线性变换，其�
 #ifndef NDEBUG
     PRINT_FUNC_NAME_();
 #endif
+// 输入数据排布: [batch_size, seq_len, head_num, size_per_head]
+// 把batch_size * seq_len看成行
+// 把head_num * size_per_head看成列
+// 第一步需要做的是：Q = input_tensor * Q_{param} + Q_{bias}
+//                K = input_tensor * K_{param} + K_{bias}
+//                V = input_tensor * V_{param} + V_{bias}
+// 其中Q_{param}, K_{param}, V_{param}大小都是
+// [head_num * size_per_head, head_num * size_per_head]
+// 我们把加上bias的部分放到cuda kernel里面去做，这里只做input_tensor * M_{param}
+// 也就是(m, k) * (k, m) = (m, n) 尺寸的矩阵乘法
     int m = batch_size_ * from_seq_len_;
     int k = head_num_ * size_per_head_;
     int n = k;
 
+// cublas的gemm是D = alpha * (A*B) + beta*C
+// 我们的问题只需要D = A*B
+// 所以alpha等于1，beta等于0
     DataType_ alpha = (DataType_)1.0f, beta = (DataType_)0.0f;
 
     try
     {
-      check_cuda_error(cublasGemmEx(param_.cublas_handle, 
-        CUBLAS_OP_N, CUBLAS_OP_N, 
-        n, m, k, 
-        &alpha, 
-        param_.attr_kernel_Q, AType_, n, 
-        param_.from_tensor, BType_, k, 
-        &beta, 
-        query_buf_, CType_, n, 
-        computeType_, 
-        static_cast<cublasGemmAlgo_t>(cublasAlgo_[0])));
+ // 输入的第一步是做input_tensor
 
-      check_cuda_error(cublasGemmEx(param_.cublas_handle, 
+ // 原始是row-major的数据，大小为：
+ // Q: m*k
+ // P: k*n
+ // R: m*n
+ // 但是cublasGemmEx需要的是列优先的数据。我们可以使用一个trick：
+ // R = Q * P
+ // R^T = P^T * Q^T
+ // P^T的列优先数据就是和P的行优先数据在内存中是一样的, Q^T同理
+ // 得到的列优先的R^T，其实和R使用行优先存储在内存中的数据是一样的
+ // 所有求行优先存储的R(大小为[m,n])变成了[n, k]的P^T矩阵(内存数据不变)和
+ // [k, m]的Q矩阵相乘得到的结果。
+      check_cuda_error(cublasGemmEx(param_.cublas_handle,
         CUBLAS_OP_N, CUBLAS_OP_N,
-        n, m, k, 
-        &alpha, 
-        param_.attr_kernel_K, AType_, n, 
-        param_.to_tensor, BType_, k, 
-        &beta, 
-        key_buf_, CType_, n, 
-        computeType_, 
-        static_cast<cublasGemmAlgo_t>(cublasAlgo_[0])));
-
-      check_cuda_error(cublasGemmEx(param_.cublas_handle, 
-        CUBLAS_OP_N, CUBLAS_OP_N, 
         n, m, k,
         &alpha,
-        param_.attr_kernel_V, AType_, n, 
-        param_.to_tensor, BType_, k, 
-        &beta, 
-        value_buf_, CType_, n, 
-        computeType_, 
+        param_.attr_kernel_Q, AType_, n,
+        param_.from_tensor, BType_, k,
+        &beta,
+        query_buf_, CType_, n,
+        computeType_,
         static_cast<cublasGemmAlgo_t>(cublasAlgo_[0])));
 
+      check_cuda_error(cublasGemmEx(param_.cublas_handle,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        n, m, k,
+        &alpha,
+        param_.attr_kernel_K, AType_, n,
+        param_.to_tensor, BType_, k,
+        &beta,
+        key_buf_, CType_, n,
+        computeType_,
+        static_cast<cublasGemmAlgo_t>(cublasAlgo_[0])));
+
+      check_cuda_error(cublasGemmEx(param_.cublas_handle,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        n, m, k,
+        &alpha,
+        param_.attr_kernel_V, AType_, n,
+        param_.to_tensor, BType_, k,
+        &beta,
+        value_buf_, CType_, n,
+        computeType_,
+        static_cast<cublasGemmAlgo_t>(cublasAlgo_[0])));
+    /*
+    里面非常重要的部分就是往cublasGemmEx喂数据的尺寸，这是一个被很多人忽略的地方。
+    具体的解释如上面的注释所说，其实核心是利用了行优先存储的矩阵Q和列优先存储的Q^T的数据在内存中是一样的，
+    这样往cublasGemmEx喂数据的时候就可以只改变矩阵尺寸而不用改变内存里面的数据，因为
+        R = Q * R
+    两边转置
+        R^T = P^T * Q^T
+    利用上面的内存存储特性，只需要往cublasGemmEx输入调换顺序并转置大小的数据就可以得到最终正确的数据。
+    */
       DataType_ scaler = 1 / sqrtf(size_per_head_ * 1.0f);
       multiHeadAttr_nofuse_kernelLauncher(
         param_.stream,

@@ -133,6 +133,8 @@ int target_index(int id1, int id2, int id3, int id4, int dim_1, int dim_2, int d
  ===>>>>void add_QKV_bias(__half* Q, const __half* bias_Q, __half* K, const __half* bias_K,
 
  * */
+
+ //接下来我们看一下float版本的add_bias
 template<typename T>
 __global__
 void add_QKV_bias(T* Q, const T* bias_Q, T* K, const T* bias_K, T* V, const T* bias_V, T* q_buf_, T* k_buf_, T* v_buf_, 
@@ -148,23 +150,36 @@ void add_QKV_bias(T* Q, const T* bias_Q, T* K, const T* bias_K, T* V, const T* b
 
     // 总共有3m个block，第一部分处理q，第二部分处理k，第三部分处理v，这里使用qkv_id区分处理哪个矩阵
 
+    // 我们抛了3m个block
+    // block [0...m-1]  : 处理Q
+    // block [m...2m-1] : 处理K
+    // block [2m...3m-1]: 处理V
   int qkv_id = blockIdx.x * word_per_block / m;
 
     // 矩阵偏移量
+
+    // (blockIdx.x * word_per_block % m)得到具体处理哪一个数据
+    // 每个数据的长度是n
+    // 所以row_offset能计算出第t行的数据相对于数据首地址的偏移
   int row_offset = (blockIdx.x * word_per_block % m) * n;
 
+  // 处理Q
   if(qkv_id == 0)
   {
     data_ptr = Q + row_offset;
     buf_ptr = q_buf_;
     bias_ptr = bias_Q;
   }
+
+  // 处理K
   else if(qkv_id == 1)
   {
     data_ptr = K + row_offset;
     buf_ptr = k_buf_;
     bias_ptr = bias_K;
   }
+
+  // 处理V
   else
   {
     data_ptr = V + row_offset;
@@ -172,6 +187,14 @@ void add_QKV_bias(T* Q, const T* bias_Q, T* K, const T* bias_K, T* V, const T* b
     bias_ptr = bias_V;
   }
 
+    // Q的数据排列
+    // batch0 word0          : (head0 0, head0 1,..., head0 size_per_head-1)(head1 0, )...
+    // batch0 word1          :
+    // batch0 word2          :
+    // ...  :
+    // batch0 word(seq_len-1):
+    // block corresponds to the row dimension
+    // total threads in one block is head_num * size_per_head
   int batch_id = (blockIdx.x * word_per_block % m) / seq_len;
   int head_id = threadIdx.x / size_per_head;
   int id_in_head = threadIdx.x % size_per_head;
@@ -190,7 +213,9 @@ void add_QKV_bias(T* Q, const T* bias_Q, T* K, const T* bias_K, T* V, const T* b
     data_ptr += n;
   }
 }
-
+// 是完整按照我们上面的数据排布来进行计算的。再看一下half，也就是fp16的版本
+// 结语
+// Fastertransformer v1.0版本的上半部分分享就到这里了。欢迎继续关注v1.0版本的下半部分以及后续更高版本的代码分享。
 template <>
 __global__
 void add_QKV_bias(__half* Q, const __half* bias_Q, __half* K, const __half* bias_K, __half* V, const __half* bias_V, 
@@ -206,6 +231,7 @@ void add_QKV_bias(__half* Q, const __half* bias_Q, __half* K, const __half* bias
 
   int bias_id = threadIdx.x;
 
+// 这种做法会有大量的cache miss
   half2* src_ptr = (half2*)Q;
   half2* dst_ptr = (half2*)q_buf_;
   const half2* bias_ptr = (const half2*)bias_Q;
@@ -400,12 +426,37 @@ void OpenMultiHeadAttention<OpType_>::multiHeadAttr_nofuse_kernelLauncher(
     dim3 grid;
     dim3 block;
 
+    /*
+    我们再来看一下第一个cuda kernel函数add_QKV_bias。它是在multiHeadAttr_nofuse_kernelLauncher被调用的，调用代码如下：
+
+
+    要搞懂这部分代码干了什么时候，我们首先需要知道输入的数据的排布。
+    我们知道，输入数据是[batch_size, seq_len, head_num, size_per_head]，具体数据在内部排布如下图：
+014.webp
+
+    而经过这个函数之后，数据的排布转换为[batch_size, head_num, seq_length, size_per_head_org]，
+    具体数据在内存的排布如下图：
+015.webp
+
+    也就是说，add_bias这个cuda kernel不但把上一步MatMul的数据加上了bias，还把数据进行了重排。
+
+        int m = batch_size * seq_len;
+        int k = head_num * size_per_head;
+
+    m 其实就是原始排布图里面的行的总数，k 是原始排布图里面列的数量。
+    代码使用了 3*m 个block，每个block一共 k 个线程来进行处理。为什么会是 3*m 个block呢？
+    因为这个kernel同时处理Q, K, V的数据，而每一个矩阵都是 m*k 大小，
+    所以我们如果一个线程处理一个数据，需要 3*m*k个 线程来进行处理。
+    对于float，代码里面使用了 3*m 个block，每个block里面 k 个线程来进行处理；
+    而对于fp16，代码一个线程里面处理相邻两个数据，所以使用了 3*m 个block，每个block里面 k/2 个线程来进行处理。
+    */
     if(OpType_ == OperationType::FP32)
     {
       const int word_per_block = 1;
       assert(k <= 1024);
       assert(m / word_per_block * 3 <= 65536);
 
+      // 我们需要同时处理Q，K， V，所以需要乘以3
       dim3 grid(m / word_per_block * 3);
       dim3 block(k);
       add_QKV_bias<DataType_><<<grid, block, 0, stream>>>(Q, bias_Q, K, bias_K, V, bias_V, q_buf_, k_buf_, v_buf_,

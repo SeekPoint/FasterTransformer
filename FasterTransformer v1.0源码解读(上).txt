@@ -1,0 +1,56 @@
+FasterTransformer v1.0源码解读(上)
+
+https://zhuanlan.zhihu.com/p/655188392
+
+
+杜凌霄
+
+
+前言
+FasterTransformer、ByteTransformer以及Flashattention算是现在对Transformer类模型推理比较快的库。
+ByteTransformer只有Encoder部分；FasterTransformer是原始的Transformer结构，Encoder结构和Decoder结构都支持。
+
+我们可以先回顾一下最原始的Transformer结构：
+
+009.webp
+
+而广泛运用的Bert结构是纯粹的Encoder结构。
+
+Fastertransformer是一个开源推理框架，已经发展到了5.3版本，Nvidia表示之后将不再更新，会把后续的工作集成在TensorRT后续版本。
+这不影响我们去读懂它的代码，为自己做优化囤积更多的背景知识。
+
+Encoder结构
+Encoder结构说简单点就是原始Transformer结构左半边的结构。我们这里首先给出上面Multi-Head Attention的结构
+010.webp
+
+Feed-Forwad的结构为
+011.webp
+
+把它们合并到一起就可以得到一个Encoder-block的完整结构：
+012.webp
+
+一个Encoder类型的模型主要就是n层encoder-block堆叠而成。一个Linear层实际上是
+O = M * I + bias
+
+也就是一个矩阵乘法再加上对应的bias。
+而实际代码在做推理的时候，是把Linear层拆分成这两步做的，
+因为矩阵乘法是可以用cuBlas这样的库来做的，bias加法和后面的scale是可以合并到一起做的。
+
+FasterTransformer V1.0实现
+详细拆分之后encoder-block结构以及在FastTransformer v1.0中对应的函数如下
+013.webp
+
+我们可以看到
+
+    一共有4个cublasGemmEx做矩阵乘法；
+
+    两个cublasGemmStrideBatchedEx做batch的矩阵乘法，也就是做多个大小一样的不同矩阵的乘法；
+
+    5个手写的cuda kernel做计算。
+
+Self-Attention进来的第一步就是使用输入数据计算Q，K和V。这一步被拆分成MatMul和add bias。
+代码首先使用cublasGemmEx做的MatMul。
+这一部分代码在open_attention.h的forward()函数开始部分：
+
+// 输入数据排布: [batch_size, seq_len, head_num, size_per_head]
+....
