@@ -1,0 +1,7 @@
+【BBuf的CUDA笔记】七，总结 FasterTransformer Decoder(GPT) 的cuda相关优化技巧
+
+https://zhuanlan.zhihu.com/p/603611192
+
+
+有原始的md
+https://github.com/BBuf/how-to-optim-algorithm-in-cuda/blob/master/FasterTransformer/README_GPT.md

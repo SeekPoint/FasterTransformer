@@ -2,6 +2,9 @@
 
 https://zhuanlan.zhihu.com/p/601130731
 
+有原始的md
+https://github.com/BBuf/how-to-optim-algorithm-in-cuda/blob/master/FasterTransformer/README_BERT.md
+
 BBuf
 
 这里总结 FasterTransformer Encoder(BERT) 的cuda相关优化技巧
