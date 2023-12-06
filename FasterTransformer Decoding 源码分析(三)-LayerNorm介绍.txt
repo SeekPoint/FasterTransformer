@@ -1,0 +1,3 @@
+FasterTransformer Decoding 源码分析(三)-LayerNorm介绍
+进击的Killua
+https://zhuanlan.zhihu.com/p/669440844
