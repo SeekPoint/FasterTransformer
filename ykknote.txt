@@ -30,3 +30,9 @@ http://giantpandacv.com/project/OneFlow/%E3%80%90BBuf%E7%9A%84CUDA%E7%AC%94%E8%A
 
 https://www.birentech.com/Research_nstitute_details/4.html
 高性能Transformer推理分析
+
+https://www.zhihu.com/question/602468960/answer/3040008501
+有没有大模型推理加速引擎FasterTransformer入门级教程？
+
+https://zhuanlan.zhihu.com/p/626303702
+Faster Transformer

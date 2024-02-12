@@ -1,0 +1,6 @@
+FasterTransformer v1.0源码解读(中)
+
+https://zhuanlan.zhihu.com/p/660387381
+
+gzh已经有下部
+
